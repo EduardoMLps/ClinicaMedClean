@@ -1,0 +1,1104 @@
+# -*- coding: utf-8 -*-
+"""Testes funcionais de ponta a ponta (E2E) do Med Flow 5.2 (SISTEMA_CLINICA.html).
+
+Como executar (na pasta do projeto):
+    pip install playwright && python -m playwright install chromium
+    set MEDFLOW_ADMIN_PASS=<senha do administrador>      (Windows)
+    export MEDFLOW_ADMIN_PASS=<senha do administrador>   (Linux/macOS)
+    python tests/test_medflow_e2e.py
+
+Resultados: tests/resultados/resultados.json e capturas em tests/resultados/capturas/.
+Observação: alguns casos usam datas fixas de outubro de 2026 (agenda de demonstração);
+depois desse período, esses casos precisam ter as datas atualizadas.
+"""
+import json, re, traceback, datetime, os, sys
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+BASE = Path(__file__).resolve().parent.parent
+ARQ = BASE / 'SISTEMA_CLINICA.html'
+OUT = BASE / 'tests' / 'resultados'
+SHOTS = OUT / 'capturas'
+SENHA = os.environ.get('MEDFLOW_ADMIN_PASS')
+if not SENHA:
+    sys.exit('Defina a variável de ambiente MEDFLOW_ADMIN_PASS com a senha do administrador.')
+SHOTS.mkdir(parents=True, exist_ok=True)
+URL = ARQ.as_uri()
+
+RES = []
+def rec(cid, area, nome, ok, evid, sev=None):
+    RES.append({'id': cid, 'area': area, 'caso': nome, 'resultado': 'PASSOU' if ok else 'FALHOU',
+                'evidencia': str(evid)[:1000], 'severidade': None if ok else (sev or 'media')})
+    print(('PASSOU ' if ok else 'FALHOU ') + cid + ' - ' + nome + ' | ' + str(evid)[:300], flush=True)
+
+def safe(cid, area, nome, fn, sev=None):
+    try:
+        fn()
+    except Exception as e:
+        rec(cid + '-EXC', area, nome + ' (exceção no roteiro)', False, 'EXCECAO: ' + repr(e)[:500], sev or 'media')
+        traceback.print_exc()
+
+ERROS = []
+def wire(page, tag):
+    def on_console(m):
+        if m.type == 'error':
+            t = m.text
+            if 'ERR_FILE_NOT_FOUND' in t or 'Failed to load resource' in t:
+                return
+            ERROS.append((tag, 'console', t))
+    page.on('console', on_console)
+    page.on('pageerror', lambda e: ERROS.append((tag, 'pageerror', str(e))))
+
+INIT = "window.__prints = 0; window.print = function(){ window.__prints++; };"
+
+def nova_pagina(browser, w=1280, h=900, tag='desktop'):
+    ctx = browser.new_context(viewport={'width': w, 'height': h}, timezone_id='America/Sao_Paulo', locale='pt-BR')
+    ctx.add_init_script(INIT)
+    page = ctx.new_page()
+    wire(page, tag)
+    page.goto(URL)
+    page.wait_for_timeout(300)
+    return ctx, page
+
+def login(page, user='adminds', pw=SENHA, enter=False):
+    """Preenche e envia; espera o hash PBKDF2 assíncrono terminar (tela some ou erro aparece)."""
+    page.evaluate("document.getElementById('senha-erro').textContent=''")
+    page.fill('#login-input', user)
+    page.fill('#senha-input', pw)
+    if enter:
+        page.focus('#senha-input'); page.keyboard.press('Enter')
+    else:
+        page.click('#senha-btn')
+    try:
+        page.wait_for_function("getComputedStyle(document.getElementById('tela-senha')).display === 'none' || document.getElementById('senha-erro').textContent.length > 0", timeout=8000)
+    except Exception:
+        pass
+    page.wait_for_timeout(150)
+
+def logado(page):
+    return page.evaluate("!document.querySelector('#tela-app').classList.contains('hidden') && getComputedStyle(document.querySelector('#tela-senha')).display==='none'")
+
+def ultimo_toast(page):
+    t = page.locator('#toasts .toast'); n = t.count()
+    return t.nth(n - 1).inner_text() if n else ''
+
+def todos_toasts(page):
+    return page.eval_on_selector_all('#toasts .toast', 'els => els.map(e => e.textContent)')
+
+def limpar_toasts(page):
+    page.evaluate("document.querySelector('#toasts').innerHTML=''")
+
+def modal(page):
+    return page.locator('#modais .modal-bg').last
+
+def nmodais(page):
+    return page.locator('#modais .modal-bg').count()
+
+def campo_modal(page, rotulo):
+    return modal(page).locator(f"xpath=.//label[contains(@class,'label') and normalize-space()='{rotulo}']/following-sibling::*[1]")
+
+def salvar_modal(page, espera=200):
+    modal(page).locator('.modal-acoes button', has_text='Salvar').click(); page.wait_for_timeout(espera)
+
+def fechar_modais(page):
+    page.evaluate("document.querySelectorAll('.modal-bg').forEach(m => m.remove())")
+
+def nav(page, nome):
+    fechar_modais(page)
+    page.locator('#nav button.nav-link', has_text=nome).first.click()
+    page.wait_for_timeout(150)
+
+def overflow(page):
+    return page.evaluate("({sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth})")
+
+def shot(page, nome, full=False):
+    p = SHOTS / (nome + '.png')
+    page.screenshot(path=str(p), full_page=full)
+    return 'capturas_v2/' + nome + '.png'
+
+PERM = sorted([*range(11, 19), *range(21, 29), *range(31, 39), *range(41, 49)])
+DEC = sorted([*range(51, 56), *range(61, 66), *range(71, 76), *range(81, 86)])
+def dentes(page):
+    return page.eval_on_selector_all('svg.odt3d-svg g.odt3d-dente text.odt3d-num', 'e=>e.map(x=>+x.textContent)')
+def dente(page, n):
+    return page.locator(f'svg.odt3d-svg g.odt3d-dente:has(text.odt3d-num:text-is("{n}"))')
+def resumo_odt(page):
+    return page.locator('#conteudo .card p', has_text='Resumo').inner_text()
+
+with sync_playwright() as pw:
+    browser = pw.chromium.launch()
+    ctx, page = nova_pagina(browser)
+
+    # ================= 1. CARREGAMENTO =================
+    def t_load():
+        vis = page.is_visible('#tela-senha')
+        app_hidden = page.locator('#tela-app').evaluate("e => e.classList.contains('hidden')")
+        foco = page.evaluate("document.activeElement && document.activeElement.id")
+        btn = page.is_visible('#btn-portal')
+        s = shot(page, '01_tela_acesso')
+        rec('CARGA-01', 'Carregamento', 'Página carrega sem erros JS e exibe #tela-senha', vis and app_hidden and not ERROS,
+            f'tela-senha={vis}, app oculto={app_hidden}, erros={ERROS}, {s}')
+        rec('CARGA-02', 'Carregamento', 'Foco inicial no campo de senha', foco in ('senha-input', 'login-input'), f'foco={foco}')
+        d = page.evaluate("({ag: db.agendamentos.length, pac: db.pacientes.length, fin: db.financeiro.length, HOJE})")
+        rec('CARGA-03', 'Carregamento', 'Objeto global db populado', d['ag'] > 0 and d['pac'] == 10, d)
+        rec('CARGA-04', 'Carregamento', 'Tela de acesso exibe o botão #btn-portal "Sou paciente"', btn, page.inner_text('#btn-portal') if btn else 'ausente')
+    safe('CARGA-01', 'Carregamento', 'carregamento', t_load)
+
+    # ================= 2. LOGIN (4 falhas no máximo antes do login certo) =================
+    def t_login():
+        login(page, '', '')
+        err = page.inner_text('#senha-erro')
+        rec('LOGIN-01', 'Login', 'Campos vazios exibem erro e não entram', 'incorretos' in err and not logado(page), f'"{err}"')
+        login(page, 'adminds', 'errada123')
+        err = page.inner_text('#senha-erro'); sv = page.input_value('#senha-input')
+        s = shot(page, '02_login_senha_errada')
+        rec('LOGIN-02', 'Login', 'Senha errada mostra erro e limpa a senha', 'incorretos' in err and sv == '' and not logado(page), f'"{err}", senha após={sv!r}, {s}')
+        login(page, 'admin', SENHA)
+        rec('LOGIN-03', 'Login', 'Login errado com senha certa é recusado', 'incorretos' in page.inner_text('#senha-erro') and not logado(page), page.inner_text('#senha-erro'))
+        login(page, 'adminds', 'DS2026')
+        rec('LOGIN-04', 'Login', 'Senha sensível a maiúsculas (DS2026 recusada)', 'incorretos' in page.inner_text('#senha-erro') and not logado(page), page.inner_text('#senha-erro'))
+        # 4 falhas acumuladas; o próximo login certo zera o contador
+        page.evaluate("document.getElementById('senha-erro').textContent=''")
+        page.fill('#login-input', '  ADMINDS ')
+        page.focus('#login-input'); page.keyboard.press('Enter')
+        foco = page.evaluate("document.activeElement.id")
+        page.keyboard.type(SENHA); page.keyboard.press('Enter')
+        page.wait_for_function("getComputedStyle(document.getElementById('tela-senha')).display === 'none' || document.getElementById('senha-erro').textContent.length > 0", timeout=8000)
+        page.wait_for_timeout(200)
+        ok = logado(page); h1 = page.inner_text('#conteudo h1') if ok else page.inner_text('#senha-erro')
+        rec('LOGIN-05', 'Login', 'Enter no login move o foco para a senha', foco == 'senha-input', f'foco={foco}')
+        rec('LOGIN-06', 'Login', '"  ADMINDS " + Enter na senha entra (PBKDF2 assíncrono), mesmo após 4 falhas', ok and h1 == 'Dashboard', f'entrou={ok}, h1/erro={h1}')
+        cont = page.evaluate('tentativasAcesso')
+        rec('LOGIN-07', 'Login', 'Login certo zera o contador de tentativas', cont == 0, f'tentativasAcesso={cont}')
+        page.click('#btn-sair-adm'); page.wait_for_timeout(150)
+        vis = page.is_visible('#tela-senha'); tl = page.evaluate("document.querySelector('#tela-login').classList.contains('hidden')")
+        login(page)
+        rec('LOGIN-08', 'Login', 'Sair volta à #tela-senha e novo login pelo botão Entrar funciona', vis and tl and logado(page), f'tela-senha={vis}, tela-login oculta={tl}, reentrou={logado(page)}')
+    safe('LOGIN', 'Login', 'login', t_login)
+
+    def t_bloqueio():
+        c2, p2 = nova_pagina(browser, tag='bloqueio')
+        msgs = []
+        for i in range(5):
+            login(p2, 'adminds', f'errada{i}')
+            msgs.append(p2.inner_text('#senha-erro'))
+        login(p2, 'adminds', SENHA)
+        e6 = p2.inner_text('#senha-erro'); dentro6 = logado(p2)
+        s = shot(p2, '02_login_bloqueado')
+        rec('LOGIN-09', 'Login', 'Após 5 tentativas erradas, login correto é bloqueado com aviso de espera', not dentro6 and 'Muitas tentativas' in e6,
+            f'msgs 1-5={set(msgs)}; 6ª (correta)="{e6}", entrou={dentro6}, {s}')
+        p2.wait_for_timeout(30500)
+        login(p2, 'adminds', SENHA)
+        rec('LOGIN-10', 'Login', 'Após 30 s o bloqueio expira e o login correto entra', logado(p2), f'entrou={logado(p2)}, erro="{p2.inner_text("#senha-erro")}"')
+        c2.close()
+    safe('LOGIN-09', 'Login', 'bloqueio', t_bloqueio)
+
+    # ================= 3. TELAS DO MENU =================
+    def t_menus():
+        itens = page.eval_on_selector_all('#nav button.nav-link', 'els => els.map(e => e.textContent.trim())')
+        esperado = {'Dashboard': 'Dashboard', 'Pacientes': 'Pacientes', 'Agenda': 'Agenda', 'Prontuário': 'Prontuário eletrônico',
+                    'Financeiro': 'Financeiro', 'Estoque': 'Estoque', 'Relatórios': 'Relatórios', 'Usuários': 'Usuários e senhas'}
+        for i, (nome, titulo) in enumerate(esperado.items()):
+            n0 = len(ERROS)
+            nav(page, nome)
+            h1 = page.inner_text('#conteudo h1')
+            ativo = page.locator('#nav button.nav-link.active').inner_text().strip()
+            nfilhos = page.evaluate("document.querySelector('#conteudo').querySelectorAll('*').length")
+            s = shot(page, f'03_tela_{i}_{nome}')
+            rec(f'TELA-{i+1:02d}', 'Navegação', f'Tela {nome} abre pelo menu e renderiza', h1 == titulo and ativo.startswith(nome) and nfilhos > 10 and len(ERROS) == n0,
+                f'h1="{h1}", ativo="{ativo}", nós={nfilhos}, erros={ERROS[n0:]}, {s}')
+        rec('TELA-09', 'Navegação', 'Menu contém "Usuários"', any(x.startswith('Usuários') for x in itens), itens)
+        nav(page, 'Dashboard')
+        kpis = page.eval_on_selector_all('#conteudo .kpi .kpi-lbl', 'els=>els.map(e=>e.textContent)')
+        vals = page.eval_on_selector_all('#conteudo .kpi .kpi-val', 'els=>els.map(e=>e.textContent)')
+        rec('DASH-01', 'Dashboard', 'Dashboard exibe 4 KPIs com valores', len(kpis) == 4 and all(vals), dict(zip(kpis, vals)))
+    safe('TELA', 'Navegação', 'menus', t_menus)
+
+    # ================= 4. PACIENTES =================
+    def t_pacientes():
+        nav(page, 'Pacientes')
+        n0 = page.evaluate('db.pacientes.length')
+        rec('PAC-01', 'Pacientes', 'Lista exibe todos os pacientes', page.locator('#conteudo table tbody tr').count() == n0, n0)
+        page.click('text=+ Novo paciente'); page.wait_for_timeout(150)
+        foco = page.evaluate("!!document.activeElement.closest('.modal')")
+        dn = campo_modal(page, 'Data de nascimento *').input_value()
+        salvar_modal(page, 80)
+        e1 = modal(page).locator('.msg-erro').inner_text()
+        campo_modal(page, 'Nome completo *').fill('   ')
+        salvar_modal(page, 80)
+        e3 = modal(page).locator('.msg-erro').inner_text()
+        campo_modal(page, 'Nome completo *').fill('Só Nome QA')
+        salvar_modal(page, 120)
+        e2 = modal(page).locator('.msg-erro').inner_text() if nmodais(page) else '(modal fechou)'
+        criado = page.evaluate("db.pacientes.some(p=>p.nome==='Só Nome QA')")
+        rec('PAC-02', 'Pacientes', 'Salvar vazio exige Nome completo', 'Nome completo' in e1, e1)
+        rec('PAC-03', 'Pacientes', 'Nome só com espaços é recusado', 'Nome completo' in e3, e3)
+        rec('PAC-04', 'Pacientes', 'Nascimento não vem pré-preenchido e é exigido', dn == '' and 'Data de nascimento' in e2 and not criado, f'valor inicial="{dn}", msg="{e2}", criado={criado}')
+        rec('PAC-05', 'Pacientes', 'Foco entra no modal ao abrir', foco, foco, 'baixa')
+        # validações
+        def tentar(nome, cpf, nasc):
+            limpar_toasts(page)
+            campo_modal(page, 'Nome completo *').fill(nome); campo_modal(page, 'CPF').fill(cpf); campo_modal(page, 'Data de nascimento *').fill(nasc)
+            salvar_modal(page, 150)
+            return ultimo_toast(page), nmodais(page), page.evaluate(f"db.pacientes.some(p=>p.nome==={json.dumps(nome)})")
+        t, m, c = tentar('CPF Curto QA', '123', '1990-01-01')
+        rec('PAC-06', 'Pacientes', 'CPF com menos de 11 dígitos recusado (modal aberto + aviso)', '11 dígitos' in t and m == 1 and not c, f'toast="{t}", modal={m}, criado={c}')
+        t, m, c = tentar('CPF Dup QA', '111.222.333-01', '1990-01-01')
+        rec('PAC-07', 'Pacientes', 'CPF duplicado recusado', 'Já existe' in t and m == 1 and not c, f'toast="{t}", modal={m}, criado={c}')
+        t, m, c = tentar('CPF Dup2 QA', '11122233302', '1990-01-01')
+        rec('PAC-08', 'Pacientes', 'CPF duplicado digitado sem máscara também é recusado', 'Já existe' in t and not c, f'toast="{t}"')
+        maxn = campo_modal(page, 'Data de nascimento *').get_attribute('max')
+        t, m, c = tentar('Futuro QA', '', '2035-01-01')
+        rec('PAC-09', 'Pacientes', 'Nascimento futuro recusado', 'futura' in t and m == 1 and not c, f'toast="{t}", input max={maxn}')
+        t, m, c = tentar('Teste QA Silva', '999.888.777-66', '1992-05-10')
+        tel_fill = None
+        n1 = page.evaluate('db.pacientes.length')
+        lst = page.locator('#conteudo table tbody tr', has_text='Teste QA Silva').count()
+        s = shot(page, '04_paciente_criado')
+        rec('PAC-10', 'Pacientes', 'Criar paciente válido', c and m == 0 and n1 == n0 + 1 and lst == 1 and 'sucesso' in t, f'toast="{t}", db {n0}->{n1}, {s}')
+        busca = page.locator('#conteudo .barra input')
+        def b(q):
+            busca.fill(q); page.wait_for_timeout(80)
+            return page.locator('#conteudo table tbody tr').count()
+        r = {'teste qa': b('teste qa'), '999.888': b('999.888'), '99988877766': b('99988877766'), 'Patricia': b('Patricia'), 'PATRÍCIA': b('PATRÍCIA'), 'xyz': b('xyzinexistente')}
+        vazio = page.inner_text('#conteudo .card')
+        b('')
+        rec('PAC-11', 'Pacientes', 'Busca por nome (case-insensitive)', r['teste qa'] == 1, r)
+        rec('PAC-12', 'Pacientes', 'Busca por CPF formatado', r['999.888'] == 1, r)
+        rec('PAC-13', 'Pacientes', 'Busca por CPF só com dígitos', r['99988877766'] == 1, r)
+        rec('PAC-14', 'Pacientes', 'Busca ignora acentos e caixa ("Patricia"/"PATRÍCIA")', r['Patricia'] == 1 and r['PATRÍCIA'] == 1, r)
+        rec('PAC-15', 'Pacientes', 'Busca sem resultado mostra mensagem', r['xyz'] == 0 and 'Nenhum paciente' in vazio, vazio[:60])
+        # editar
+        page.locator('#conteudo table tbody tr', has_text='Teste QA Silva').locator('button', has_text='Editar').click(); page.wait_for_timeout(150)
+        tit = modal(page).locator('h3').inner_text()
+        pre = {k: campo_modal(page, k).input_value() for k in ['Nome completo *', 'CPF', 'Data de nascimento *', 'Telefone', 'E-mail']}
+        campo_modal(page, 'Telefone').fill('(41) 97777-1234'); campo_modal(page, 'Nome completo *').fill('Teste QA Silva Editado')
+        limpar_toasts(page); salvar_modal(page, 200)
+        reg = page.evaluate("db.pacientes.find(p=>p.cpf==='999.888.777-66')")
+        n2 = page.evaluate('db.pacientes.length')
+        s = shot(page, '04_paciente_editado')
+        rec('PAC-16', 'Pacientes', 'Editar paciente: modal pré-preenchido, salva sem duplicar (mesmo CPF permitido)',
+            tit == 'Editar paciente' and pre['Nome completo *'] == 'Teste QA Silva' and pre['CPF'] == '999.888.777-66' and pre['Data de nascimento *'] == '1992-05-10'
+            and reg['tel'] == '(41) 97777-1234' and reg['nome'] == 'Teste QA Silva Editado' and n2 == n1 and 'atualizado' in ultimo_toast(page),
+            f'título="{tit}", pré={pre}, após={reg}, total {n1}->{n2}, toast="{ultimo_toast(page)}", {s}')
+        page.locator('#conteudo table tbody tr', has_text='Teste QA Silva Editado').locator('button', has_text='Editar').click(); page.wait_for_timeout(150)
+        limpar_toasts(page)
+        campo_modal(page, 'CPF').fill('111.222.333-03'); salvar_modal(page, 150)
+        t = ultimo_toast(page); cpf = page.evaluate("db.pacientes.find(p=>p.nome==='Teste QA Silva Editado').cpf")
+        rec('PAC-17', 'Pacientes', 'Editar: trocar para CPF de outro paciente é recusado', 'Já existe' in t and cpf == '999.888.777-66', f'toast="{t}", cpf={cpf}')
+        page.keyboard.press('Escape'); page.wait_for_timeout(100)
+        rec('PAC-18', 'Pacientes', 'Esc fecha o modal de paciente sem salvar', nmodais(page) == 0 and page.evaluate("db.pacientes.find(p=>p.nome==='Teste QA Silva Editado').cpf") == '999.888.777-66', f'modais={nmodais(page)}')
+        page.click('text=+ Novo paciente'); page.wait_for_timeout(100)
+        modal(page).locator('button', has_text='Cancelar').click(); c1 = nmodais(page)
+        page.click('text=+ Novo paciente'); page.wait_for_timeout(100)
+        page.mouse.click(5, 5); page.wait_for_timeout(80); c2 = nmodais(page)
+        rec('PAC-19', 'Pacientes', 'Modal fecha por Cancelar e por clique fora', c1 == 0 and c2 == 0, (c1, c2))
+        page.locator('#conteudo table tbody tr', has_text='Teste QA Silva Editado').locator('button', has_text='Prontuário').click(); page.wait_for_timeout(150)
+        h3 = page.locator('#conteudo .card h3').first.inner_text()
+        rec('PAC-20', 'Pacientes', 'Botão Prontuário abre o prontuário do paciente', h3 == 'Teste QA Silva Editado', h3)
+    safe('PAC', 'Pacientes', 'pacientes', t_pacientes)
+
+    # ================= 5. AGENDA: dados semeados =================
+    def t_agenda_dados():
+        r = page.evaluate(r"""() => {
+          const out = {dias:0, foraFaixa:[], domingos:[], vazios:[], procs:{}, pacs:{}, profs:{}, status:{}, pagos:0, depoisFim:0};
+          const am = new Date(hoje); am.setDate(am.getDate()+1);
+          const ini = iso(am), fim = '2026-12-31';
+          const fut = db.agendamentos.filter(a => a.data >= ini), hist = db.agendamentos.filter(a => a.data < ini);
+          out.depoisFim = fut.filter(a => a.data > fim).length;
+          const porDia = {}; fut.forEach(a => { (porDia[a.data] = porDia[a.data] || []).push(a); });
+          for (let d = dataDe(ini); d <= dataDe(fim); d.setDate(d.getDate()+1)) {
+            const s = iso(d), lst = porDia[s] || [];
+            if (d.getDay() === 0) { if (lst.length) out.domingos.push(s + ':' + lst.length); continue; }
+            out.dias++;
+            if (!lst.length) out.vazios.push(s); else if (lst.length < 4 || lst.length > 6) out.foraFaixa.push(s + ':' + lst.length);
+          }
+          const exato = (arr, campo) => { const k = {}, r = []; arr.filter(a => a.status !== 'Cancelado').forEach(a => { const c = a.data+' '+a.hora+' '+campo+a[campo]; if (k[c]) r.push(c); k[c]=1; }); return r; };
+          const min = h => +h.slice(0,2)*60 + +h.slice(3);
+          const ovl = (arr, campo) => { const g = {}, r = [];
+            arr.filter(a => a.status !== 'Cancelado').forEach(a => { const k = a.data + '#' + a[campo]; (g[k] = g[k] || []).push(a); });
+            Object.keys(g).forEach(k => { const l = g[k].sort((x,y) => x.hora.localeCompare(y.hora));
+              for (let i = 1; i < l.length; i++) { const p = l[i-1]; if (min(p.hora) + proce(p.proc).duracao > min(l[i].hora)) r.push(p.data+' '+p.hora+'('+proce(p.proc).duracao+'min) x '+l[i].hora+' '+campo+'='+p[campo]); } });
+            return r; };
+          out.futCad = exato(fut, 'cadeira_id'); out.futProf = exato(fut, 'profissional_id');
+          out.histCad = exato(hist, 'cadeira_id'); out.histProf = exato(hist, 'profissional_id');
+          out.ovFutCad = ovl(fut, 'cadeira_id'); out.ovFutProf = ovl(fut, 'profissional_id');
+          out.ovHistCad = ovl(hist, 'cadeira_id'); out.ovHistProf = ovl(hist, 'profissional_id');
+          fut.forEach(a => { out.procs[proce(a.proc).nome] = (out.procs[proce(a.proc).nome]||0)+1; out.pacs[pac(a.paciente_id).nome]=(out.pacs[pac(a.paciente_id).nome]||0)+1;
+            out.profs[prof(a.profissional_id).nome]=(out.profs[prof(a.profissional_id).nome]||0)+1; out.status[a.status]=(out.status[a.status]||0)+1; if (a.pago) out.pagos++; });
+          out.total = fut.length; out.ini = ini; out.totalHist = hist.length;
+          for (const k of ['futCad','futProf','histCad','histProf','ovFutCad','ovFutProf','ovHistCad','ovHistProf']) { out['n_'+k] = out[k].length; out[k] = out[k].slice(0,4); }
+          return out; }""")
+        Path(OUT / 'agenda_futura_analise.json').write_text(json.dumps(r, ensure_ascii=False, indent=1))
+        rec('AGD-01', 'Agenda futura', 'Todo dia seg-sáb de amanhã a 31/12/2026 com 4-6 atendimentos', not r['vazios'] and not r['foraFaixa'],
+            f"{r['ini']}..2026-12-31: {r['dias']} dias, {r['total']} atendimentos; vazios={r['vazios'][:5]}, fora={r['foraFaixa'][:5]}")
+        rec('AGD-02', 'Agenda futura', 'Nenhum atendimento em domingo', not r['domingos'], r['domingos'][:5])
+        rec('AGD-03', 'Agenda futura', 'Sem conflito exato data+hora+cadeira e data+hora+profissional', r['n_futCad'] == 0 and r['n_futProf'] == 0, f"cad={r['futCad']}, prof={r['futProf']}")
+        rec('AGD-04', 'Agenda futura', 'Sem sobreposição por DURAÇÃO na mesma cadeira', r['n_ovFutCad'] == 0, f"{r['n_ovFutCad']} ex.: {r['ovFutCad']}")
+        rec('AGD-05', 'Agenda futura', 'Sem sobreposição por DURAÇÃO no mesmo profissional', r['n_ovFutProf'] == 0, f"{r['n_ovFutProf']} ex.: {r['ovFutProf']}")
+        rec('AGD-06', 'Agenda (histórico)', 'Histórico semeado sem conflito exato nem sobreposição por duração (cadeira e profissional)',
+            r['n_histCad'] + r['n_histProf'] + r['n_ovHistCad'] + r['n_ovHistProf'] == 0,
+            f"hist={r['totalHist']} itens; exato cad={r['n_histCad']}, prof={r['n_histProf']}; duração cad={r['n_ovHistCad']} {r['ovHistCad']}, prof={r['n_ovHistProf']} {r['ovHistProf']}")
+        rec('AGD-07', 'Agenda futura', 'Procedimentos, pacientes e profissionais variados', len(r['procs']) >= 6 and len(r['pacs']) >= 8 and len(r['profs']) == 3,
+            f"procs={r['procs']}; pacientes={len(r['pacs'])}; profs={r['profs']}")
+        rec('AGD-08', 'Agenda futura', 'Nada após 31/12/2026, nada pago, status Agendado/Confirmado', r['depoisFim'] == 0 and r['pagos'] == 0 and set(r['status']) <= {'Agendado', 'Confirmado'},
+            f"após={r['depoisFim']}, pagos={r['pagos']}, status={r['status']}")
+    safe('AGD', 'Agenda futura', 'dados', t_agenda_dados)
+
+    # ================= 5b. AGENDA: interface =================
+    def novo_ag(pac_id, prof_id, proc_id, data, hora, cad):
+        limpar_toasts(page)
+        page.click('text=+ Novo agendamento'); page.wait_for_timeout(120)
+        campo_modal(page, 'Paciente *').select_option(str(pac_id))
+        campo_modal(page, 'Profissional *').select_option(str(prof_id))
+        campo_modal(page, 'Procedimento *').select_option(str(proc_id))
+        campo_modal(page, 'Data *').fill(data)
+        campo_modal(page, 'Horário *').fill(hora)
+        campo_modal(page, 'Cadeira *').select_option(str(cad))
+        n0 = page.evaluate('db.agendamentos.length')
+        salvar_modal(page, 200)
+        n1 = page.evaluate('db.agendamentos.length')
+        aberto = nmodais(page)
+        t = ultimo_toast(page)
+        if aberto: fechar_modais(page)
+        return n1 - n0, t, aberto
+
+    def t_agenda_ui():
+        nav(page, 'Agenda')
+        # a Agenda abre na visão Semana; os casos AGE usam a lista do dia
+        page.locator('#conteudo .ag-abas button', has_text='Dia').click(); page.wait_for_timeout(120)
+        hoje = page.evaluate('HOJE'); amanha = page.evaluate('maisDias(1)')
+        inp = page.locator('#conteudo .barra input[type=date]')
+        rows = page.locator('#conteudo table tbody tr').count(); dbh = page.evaluate("db.agendamentos.filter(a=>a.data===HOJE).length")
+        rec('AGE-01', 'Agenda', 'Agenda abre em hoje com os atendimentos do dia', inp.input_value() == hoje and rows == dbh, f'{inp.input_value()} linhas={rows} db={dbh}')
+        evid, okd = [], True
+        for d in [amanha, '2026-10-10', '2026-11-14', '2026-12-31', '2026-12-26']:
+            inp.fill(d); page.wait_for_timeout(80)
+            n = page.locator('#conteudo table tbody tr').count(); evid.append(f'{d}={n}')
+            if not 4 <= n <= 6: okd = False
+        rec('AGE-02', 'Agenda', 'Navegar datas pela UI mostra 4-6 atendimentos em dias úteis futuros', okd, evid)
+        inp.fill('2026-10-04'); page.wait_for_timeout(80); m1 = page.inner_text('#conteudo .card')
+        inp.fill('2027-01-04'); page.wait_for_timeout(80); m2 = page.inner_text('#conteudo .card')
+        rec('AGE-03', 'Agenda', 'Domingo e 2027 sem atendimentos mostram mensagem vazia', 'Nenhuma consulta' in m1 and 'Nenhuma consulta' in m2, (m1[:50], m2[:50]))
+        inp.fill('2026-10-10'); page.wait_for_timeout(80)
+        tot = page.locator('#conteudo table tbody tr').count(); sel = page.locator('#conteudo .barra select'); res = {}
+        for pid in ['1', '2', '3']:
+            sel.select_option(pid); page.wait_for_timeout(80)
+            res[pid] = page.eval_on_selector_all('#conteudo table tbody tr td:nth-child(4)', 'e=>e.map(x=>x.textContent)')
+        sel.select_option('')
+        rec('AGE-04', 'Agenda', 'Filtro por profissional', all(len(set(v)) <= 1 for v in res.values()) and sum(len(v) for v in res.values()) == tot, {k: len(v) for k, v in res.items()})
+        sel.select_option('2'); page.locator('#conteudo .barra button', has_text='Hoje').click(); page.wait_for_timeout(120)
+        rec('AGE-05', 'Agenda', 'Botão Hoje volta para hoje e limpa filtro', page.locator('#conteudo .barra input[type=date]').input_value() == hoje and page.locator('#conteudo .barra select').input_value() == '', 'ok')
+
+        # encontrar janela livre para testes de duração: canal(90) às H, cadeira 1, Dra. Camila (1)
+        slot = page.evaluate("""() => {
+          const add = (h, m) => { const t = minutosDe(h) + m; return String(Math.floor(t/60)).padStart(2,'0') + ':' + String(t%60).padStart(2,'0'); };
+          for (let d = dataDe('2026-10-19'); d <= dataDe('2026-12-30'); d.setDate(d.getDate()+1)) {
+            if (d.getDay() === 0) continue; const s = iso(d);
+            for (const h of HORARIOS) {
+              const h30 = add(h, 30), h90 = add(h, 90);
+              if (!choqueAgenda(s, h, 4, 1, 1) && !choqueAgenda(s, h30, 1, 1, 2) && !choqueAgenda(s, h30, 1, 2, 1) && !choqueAgenda(s, h90, 1, 1, 2) && !choqueAgenda(s, h30, 1, 2, 2))
+                return {data:s, h, h30, h90};
+            }
+          } return null; }""")
+        d, h, h30, h90 = slot['data'], slot['h'], slot['h30'], slot['h90']
+        dlt, t, ab = novo_ag(3, 1, 4, d, h, 1)
+        dv = page.locator('#conteudo .barra input[type=date]').input_value()
+        lin = page.locator('#conteudo table tbody tr', has_text='Maria Clara').filter(has_text=h).count()
+        s = shot(page, '05_agenda_criado')
+        rec('AGE-06', 'Agenda', 'Criar agendamento em horário livre (Canal 90 min)', dlt == 1 and 'criado' in t and dv == d and lin >= 1, f'{d} {h} cad1 Dra.Camila; toast="{t}", data exibida={dv}, {s}')
+        dlt, t, ab = novo_ag(4, 2, 1, d, h, 1)
+        rec('AGE-07', 'Agenda', 'Conflito exato data+hora+cadeira bloqueado, modal permanece', dlt == 0 and 'Conflito' in t and 'cadeira' in t and ab == 1, f'toast="{t}", modal={ab}')
+        dlt, t, ab = novo_ag(4, 1, 1, d, h, 2)
+        rec('AGE-08', 'Agenda', 'Mesmo profissional, outra cadeira, mesmo horário: bloqueado', dlt == 0 and 'profissional' in t, f'toast="{t}"')
+        dlt, t, ab = novo_ag(4, 2, 1, d, h30, 1)
+        s = shot(page, '05_conflito_duracao')
+        rec('AGE-09', 'Agenda', f'Conflito por DURAÇÃO na mesma cadeira ({h30}, dentro dos 90 min do canal) bloqueado', dlt == 0 and 'cadeira' in t and '90 min' in t, f'toast="{t}", {s}')
+        dlt, t, ab = novo_ag(4, 1, 1, d, h30, 2)
+        rec('AGE-10', 'Agenda', f'Conflito por DURAÇÃO com o mesmo profissional em outra cadeira ({h30}) bloqueado', dlt == 0 and 'profissional' in t, f'toast="{t}"')
+        dlt, t, ab = novo_ag(4, 2, 1, d, h90, 1)
+        rec('AGE-11', 'Agenda', f'Horário logo após o fim do canal ({h90}, mesma cadeira) é permitido', dlt == 1 and 'criado' in t, f'toast="{t}"')
+        dlt, t, ab = novo_ag(5, 2, 1, d, h30, 2)
+        rec('AGE-12', 'Agenda', 'Outro profissional em outra cadeira no mesmo intervalo é permitido', dlt == 1, f'toast="{t}"')
+        _hj = datetime.date.today(); _dom = _hj + datetime.timedelta(days=(6 - _hj.weekday()) or 7)
+        dlt, t, ab = novo_ag(4, 2, 1, _dom.isoformat(), '09:00', 1)
+        rec('AGE-13', 'Agenda', 'Domingo recusado', dlt == 0 and 'domingo' in t.lower(), f'toast="{t}"')
+        dlt, t, ab = novo_ag(4, 2, 1, '2020-01-02', '09:00', 1)
+        rec('AGE-14', 'Agenda', 'Data passada recusada', dlt == 0 and 'passada' in t, f'toast="{t}"')
+        free3 = page.evaluate("(() => { for (const d of ['2026-10-21','2026-10-22','2026-10-23']) if (!choqueAgenda(d,'03:00',1,1,2)) return d; })()")
+        dlt, t, ab = novo_ag(4, 2, 1, free3, '03:00', 1)
+        rec('AGE-15', 'Agenda', 'Horário fora do expediente (03:00) recusado', dlt == 0, f'{free3} 03:00 -> criado={dlt == 1}, toast="{t}" (modalAgendamento linhas 1280-1300 não valida faixa de horário)', 'baixa')
+        page.click('text=+ Novo agendamento'); page.wait_for_timeout(120)
+        campo_modal(page, 'Horário *').fill(''); salvar_modal(page, 100)
+        e = modal(page).locator('.msg-erro').inner_text(); fechar_modais(page)
+        rec('AGE-16', 'Agenda', 'Horário obrigatório validado', 'Horário' in e, e)
+        # status e pagamento
+        page.locator('#conteudo .barra input[type=date]').fill(d); page.wait_for_timeout(100)
+        limpar_toasts(page)
+        tr = lambda: page.locator('#conteudo table tbody tr', has_text='Maria Clara').filter(has_text=h).first
+        tr().locator('select').select_option('Confirmado'); page.wait_for_timeout(150)
+        st = page.evaluate(f"db.agendamentos.find(a=>a.data==='{d}'&&a.hora==='{h}'&&a.paciente_id===3).status")
+        rec('AGE-17', 'Agenda', 'Mudar status pelo select', st == 'Confirmado' and 'Status' in ultimo_toast(page), st)
+        tr().locator('button', has_text='Receber').click(); page.wait_for_timeout(120)
+        campo_modal(page, 'Forma de pagamento *').select_option('Pix'); salvar_modal(page, 200)
+        a = page.evaluate(f"db.agendamentos.find(a=>a.data==='{d}'&&a.hora==='{h}'&&a.paciente_id===3)")
+        f = page.evaluate("db.financeiro[db.financeiro.length-1]")
+        rec('AGE-18', 'Agenda', 'Receber: pago, Concluído e receita lançada', a['pago'] and a['status'] == 'Concluído' and f['valor'] == 850 and f['agendamento_id'] == a['id'],
+            f"ag={a['status']}/{a['forma']}, lanc={f['valor']} {f['forma']}")
+        # Cancelado / Faltou sem Receber
+        out = {}
+        for stt in ['Cancelado', 'Faltou']:
+            alvo = page.locator('#conteudo table tbody tr').filter(has=page.locator('button', has_text='Receber')).first
+            hh = alvo.locator('td').first.inner_text()
+            alvo.locator('select').select_option(stt); page.wait_for_timeout(150)
+            linha = page.locator('#conteudo table tbody tr', has_text=hh).first
+            out[stt] = (hh, linha.locator('button', has_text='Receber').count())
+        rec('AGE-19', 'Agenda', 'Consultas Cancelado/Faltou não oferecem "Receber"', all(v[1] == 0 for v in out.values()), out)
+        # Esc no modal de agendamento
+        page.click('text=+ Novo agendamento'); page.wait_for_timeout(150)
+        fo = page.evaluate("!!document.activeElement.closest('.modal')")
+        page.keyboard.press('Escape'); page.wait_for_timeout(100)
+        rec('AGE-20', 'Agenda', 'Modal de agendamento: foco entra no modal e Esc fecha', fo and nmodais(page) == 0, f'foco no modal={fo}, modais={nmodais(page)}')
+    safe('AGE', 'Agenda', 'agenda ui', t_agenda_ui)
+
+    # ================= 6. PRONTUÁRIO / ODONTOGRAMA =================
+    def t_odonto():
+        nav(page, 'Prontuário')
+        page.locator('#conteudo .barra select').select_option('1'); page.wait_for_timeout(150)
+        nomes = dentes(page)
+        s = shot(page, '06_odonto_3d', full=True)
+        rec('ODT-01', 'Odontograma', '3D permanente: 32 dentes', page.locator('g.odt3d-dente').count() == 32, s)
+        rec('ODT-02', 'Odontograma', 'FDI permanente 11-18,21-28,31-38,41-48', sorted(nomes) == PERM and len(set(nomes)) == 32, sorted(nomes))
+        pos = page.evaluate("""() => { const r = {}; document.querySelectorAll('g.odt3d-dente').forEach(g => { const n = +g.querySelector('text.odt3d-num').textContent; const b = g.getBoundingClientRect(); r[n] = [b.x + b.width/2, b.y + b.height/2]; }); return r; }""")
+        rec('ODT-03', 'Odontograma', 'Orientação anatômica (Q1/Q4 à esquerda, maxila em cima)', pos['11'][0] < pos['21'][0] and pos['41'][0] < pos['31'][0] and pos['11'][1] < pos['41'][1], {k: pos[k] for k in ['11', '21', '41', '31']})
+        page.locator('.odt-toolbar button', has_text='Decíduos').click(); page.wait_for_timeout(150)
+        rec('ODT-04', 'Odontograma', 'Decíduos: 20 dentes 51-55,61-65,71-75,81-85', sorted(dentes(page)) == DEC, sorted(dentes(page)))
+        page.locator('.odt-toolbar button', has_text='Permanentes').click(); page.wait_for_timeout(150)
+        rec('ODT-05', 'Odontograma', 'Volta para Permanentes (32)', len(dentes(page)) == 32, len(dentes(page)))
+        page.locator('#conteudo .barra select').select_option('10'); page.wait_for_timeout(150)
+        rec('ODT-06', 'Odontograma', 'Paciente < 13 anos abre em decíduos', sorted(dentes(page)) == DEC, len(dentes(page)))
+        page.locator('#conteudo .barra select').select_option('1'); page.wait_for_timeout(150)
+        rec('ODT-07', 'Odontograma', 'Dente 26 (com evolução) marcado "com atendimento"', 'com atendimento' in dente(page, 26).get_attribute('aria-label'), dente(page, 26).get_attribute('aria-label'))
+        dente(page, 16).hover(); page.wait_for_timeout(150)
+        h4, tp = page.inner_text('.odt3d-info h4'), page.inner_text('.odt3d-info .odt3d-tipo')
+        page.mouse.move(5, 5); page.wait_for_timeout(120)
+        h4c = page.inner_text('.odt3d-info h4')
+        rec('ODT-08', 'Odontograma', 'Hover atualiza painel e restaura ao sair', h4 == 'Dente 16' and 'Primeiro molar superior direito' in tp and h4c == 'Arcadas', (h4, tp, h4c))
+        dente(page, 16).click(); page.wait_for_timeout(200)
+        mt = modal(page).locator('h3').inner_text()
+        foco = page.evaluate("!!document.activeElement.closest('.modal')")
+        modal(page).locator('.odt-opt', has_text='Cárie').click()
+        modal(page).locator('.odt-chip', has_text='M').click(); modal(page).locator('.odt-chip', has_text='O').click()
+        modal(page).locator('textarea').fill('Cárie oclusal profunda QA')
+        modal(page).locator('button', has_text='Salvar').click(); page.wait_for_timeout(200)
+        g = dente(page, 16); al = g.get_attribute('aria-label')
+        fc = g.locator('text.odt3d-fc').text_content() if g.locator('text.odt3d-fc').count() else ''
+        fills = g.locator('path').evaluate_all('e=>e.map(x=>x.getAttribute("fill"))')
+        s = shot(page, '06_dente16_carie')
+        rec('ODT-09', 'Odontograma', 'Clique abre modal "Dente 16" com foco dentro', mt == 'Dente 16' and foco, (mt, foco))
+        rec('ODT-10', 'Odontograma', 'Salvar Cárie+M,O+obs: cor, letras, ponto, aria-label e resumo',
+            '#fde2e1' in fills and fc == 'MO' and g.locator('circle').count() == 1 and 'faces M O' in al and 'observação: Cárie oclusal' in al and '1 cárie' in resumo_odt(page),
+            f'fc={fc}, aria="{al}", resumo="{resumo_odt(page)}", {s}')
+        dente(page, 18).click(); page.wait_for_timeout(120)
+        modal(page).locator('.odt-opt', has_text='Ausente').click(); modal(page).locator('button', has_text='Salvar').click(); page.wait_for_timeout(200)
+        rec('ODT-11', 'Odontograma', 'Ausente (18) tracejado e no resumo', dente(page, 18).locator('path[stroke-dasharray="3 3"]').count() == 1 and '1 ausente' in resumo_odt(page), resumo_odt(page))
+        # teclado + Esc
+        page.locator('#conteudo .barra select').focus()
+        foc = None
+        for i in range(60):
+            page.keyboard.press('Tab')
+            foc = page.evaluate("(() => { const a = document.activeElement; return a && a.classList && a.classList.contains('odt3d-dente') ? a.getAttribute('aria-label') : null })()")
+            if foc: break
+        rec('ODT-12', 'Odontograma', 'Tab alcança dentes começando pelo 18 e painel acompanha', bool(foc) and foc.startswith('Dente 18') and page.inner_text('.odt3d-info h4') == 'Dente 18', (foc or '')[:40])
+        page.keyboard.press('Tab'); page.keyboard.press('Enter'); page.wait_for_timeout(200)
+        mt = modal(page).locator('h3').inner_text() if nmodais(page) else ''
+        fm = page.evaluate("!!document.activeElement.closest('.modal')")
+        page.keyboard.press('Escape'); page.wait_for_timeout(120)
+        rec('ODT-13', 'Odontograma', 'Enter abre modal do dente focado (17), foco entra no modal e Esc fecha', mt == 'Dente 17' and fm and nmodais(page) == 0, f'modal="{mt}", foco no modal={fm}, abertos após Esc={nmodais(page)}')
+        dente(page, 11).focus(); page.keyboard.press(' '); page.wait_for_timeout(150)
+        mt = modal(page).locator('h3').inner_text() if nmodais(page) else ''
+        page.keyboard.press('Escape')
+        rec('ODT-14', 'Odontograma', 'Espaço também abre o modal', mt == 'Dente 11', mt)
+        # grade
+        page.locator('.odt-toolbar button', has_text='Ver em grade').click(); page.wait_for_timeout(150)
+        bt16 = page.locator('button.odt-dente', has=page.locator('.odt-num', has_text='16'))
+        ok = page.locator('button.odt-dente').count() == 32 and '#fde2e1' in bt16.get_attribute('style') and bt16.locator('.odt-faces').inner_text() == 'MO'
+        page.locator('button.odt-dente', has=page.locator('.odt-num', has_text='17')).click(); page.wait_for_timeout(120)
+        modal(page).locator('.odt-opt', has_text='Restaurado').click(); modal(page).locator('button', has_text='Salvar').click(); page.wait_for_timeout(150)
+        rec('ODT-15', 'Odontograma', 'Grade: 32 botões, dados preservados, edição pela grade', ok and page.evaluate('db.odontograma[1][17].estado') == 'restaurado', shot(page, '06_grade', True))
+        page.locator('.odt-toolbar button', has_text='Ver arcada 3D').click(); page.wait_for_timeout(150)
+        rec('ODT-16', 'Odontograma', 'Volta para 3D com a edição feita na grade', len(dentes(page)) == 32 and 'Restaurado' in dente(page, 17).get_attribute('aria-label'), dente(page, 17).get_attribute('aria-label'))
+        page.locator('.odt-toolbar button', has_text='+ Registrar dente').click(); page.wait_for_timeout(120)
+        limpar_toasts(page); modal(page).locator('button', has_text='Salvar').click(); page.wait_for_timeout(100)
+        t1 = ultimo_toast(page)
+        modal(page).locator('select').select_option('21'); modal(page).locator('.odt-opt', has_text='Coroa').click(); modal(page).locator('.odt-chip', has_text='V').click()
+        modal(page).locator('button', has_text='Salvar').click(); page.wait_for_timeout(200)
+        rec('ODT-17', 'Odontograma', '"+ Registrar dente" exige o dente e registra 21 Coroa face V', 'Escolha o dente' in t1 and 'Coroa' in dente(page, 21).get_attribute('aria-label'), (t1, dente(page, 21).get_attribute('aria-label')))
+        dente(page, 17).click(); page.wait_for_timeout(100)
+        modal(page).locator('.odt-opt', has_text='Hígido').click(); modal(page).locator('button', has_text='Salvar').click(); page.wait_for_timeout(150)
+        rec('ODT-18', 'Odontograma', 'Hígido sem faces/obs remove o registro', page.evaluate('!(17 in db.odontograma[1])'), page.evaluate('Object.keys(db.odontograma[1])'))
+        # aviso de outra dentição
+        av0 = page.locator('#conteudo .card p', has_text='outra dentição').count()
+        page.locator('.odt-toolbar button', has_text='+ Registrar dente').click(); page.wait_for_timeout(100)
+        modal(page).locator('select').select_option('55'); modal(page).locator('.odt-opt', has_text='Selante').click()
+        modal(page).locator('button', has_text='Salvar').click(); page.wait_for_timeout(150)
+        av = page.locator('#conteudo .card p', has_text='outra dentição')
+        avt = av.inner_text() if av.count() else ''
+        s = shot(page, '06_aviso_outra_denticao')
+        rec('ODT-19', 'Odontograma', 'Aviso quando há registro em dente da outra dentição (55 em adulto)', av0 == 0 and '55' in avt and 'Decíduos' in avt, f'antes={av0}, aviso="{avt}", {s}')
+        page.locator('.odt-toolbar button', has_text='Decíduos').click(); page.wait_for_timeout(150)
+        avd = page.locator('#conteudo .card p', has_text='outra dentição')
+        avdt = avd.inner_text() if avd.count() else ''
+        rec('ODT-20', 'Odontograma', 'No modo decíduo o 55 aparece e o aviso passa a apontar os permanentes', 'Selante' in dente(page, 55).get_attribute('aria-label') and '16' in avdt and 'Permanentes' in avdt, avdt)
+        page.locator('.odt-toolbar button', has_text='Permanentes').click(); page.wait_for_timeout(150)
+        # persistência e isolamento
+        nav(page, 'Agenda'); nav(page, 'Prontuário'); page.locator('#conteudo .barra select').select_option('1'); page.wait_for_timeout(150)
+        p1 = 'Cárie' in dente(page, 16).get_attribute('aria-label')
+        page.locator('#conteudo .barra select').select_option('2'); page.wait_for_timeout(150)
+        p2 = 'Hígido' in dente(page, 16).get_attribute('aria-label')
+        page.locator('#conteudo .barra select').select_option('1'); page.wait_for_timeout(150)
+        rec('ODT-21', 'Odontograma', 'Persiste ao navegar e é isolado por paciente', p1 and p2, (p1, p2))
+        p0 = page.evaluate('window.__prints')
+        page.locator('.odt-toolbar button', has_text='Imprimir').click(); page.wait_for_timeout(50)
+        txt = page.evaluate("(document.getElementById('odt-print')||{}).innerText || ''")
+        page.wait_for_timeout(500)
+        rec('ODT-22', 'Odontograma', 'Imprimir monta relatório e chama print (stub)', page.evaluate('window.__prints') == p0 + 1 and 'Relatório de Odontograma' in txt and 'Cárie' in txt and not page.evaluate("!!document.getElementById('odt-print')"), txt[:120])
+        Path(OUT / 'odontograma_print.txt').write_text(txt)
+    safe('ODT', 'Odontograma', 'odontograma', t_odonto)
+
+    def t_evolucao():
+        nav(page, 'Prontuário'); page.locator('#conteudo .barra select').select_option('1'); page.wait_for_timeout(150)
+        ncards0 = page.evaluate("db.prontuarios.filter(r=>r.paciente_id===1).length")
+        evo_txt0 = page.locator('#conteudo .card').first.inner_text()
+        btn = page.locator('#conteudo button', has_text='+ Nova evolução')
+        rec('EVO-01', 'Prontuário', 'Botão "+ Nova evolução" presente', btn.count() == 1, btn.count())
+        btn.click(); page.wait_for_timeout(150)
+        tit = modal(page).locator('h3').inner_text()
+        dv = campo_modal(page, 'Data *').input_value()
+        salvar_modal(page, 100)
+        e = modal(page).locator('.msg-erro').inner_text()
+        rec('EVO-02', 'Prontuário', 'Modal de evolução: título, data padrão hoje, obrigatórios validados', tit == 'Nova evolução clínica' and dv == page.evaluate('HOJE') and 'Evolução' in e, (tit, dv, e))
+        campo_modal(page, 'Evolução *').fill('Dor ao mastigar no 36 QA'); campo_modal(page, 'Conduta *').fill('Restauração programada QA')
+        res = {}
+        for den in ['19', '50', '86', '9', 'abc', '60']:
+            limpar_toasts(page); campo_modal(page, 'Dente (FDI, opcional)').fill(den); salvar_modal(page, 120)
+            res[den] = (ultimo_toast(page), nmodais(page))
+        rec('EVO-03', 'Prontuário', 'Dente FDI inválido (19, 50, 86, 9, abc, 60) é recusado com aviso', all('FDI' in v[0] and v[1] == 1 for v in res.values()), res)
+        campo_modal(page, 'Dente (FDI, opcional)').fill('36')
+        limpar_toasts(page); campo_modal(page, 'Data *').fill('2026-12-01'); salvar_modal(page, 120)
+        tf = ultimo_toast(page)
+        rec('EVO-04', 'Prontuário', 'Data futura recusada', 'futura' in tf and nmodais(page) == 1, tf)
+        campo_modal(page, 'Data *').fill(page.evaluate('HOJE')); campo_modal(page, 'Profissional *').select_option('3')
+        limpar_toasts(page); salvar_modal(page, 200)
+        n1 = page.evaluate("db.prontuarios.filter(r=>r.paciente_id===1).length")
+        card = page.locator('#conteudo .card', has_text='Dor ao mastigar no 36 QA')
+        badge = card.locator('.badge').all_inner_texts() if card.count() else []
+        evo_txt = page.locator('#conteudo .card').first.inner_text()
+        at36 = 'com atendimento' in dente(page, 36).get_attribute('aria-label')
+        s = shot(page, '06_nova_evolucao', True)
+        rec('EVO-05', 'Prontuário', 'Evolução válida (dente 36) aparece na lista, contador sobe e dente 36 vira "com atendimento"',
+            n1 == ncards0 + 1 and card.count() == 1 and 'Dente 36' in badge and 'Beatriz' in card.inner_text() and at36 and 'Evolução registrada' in ultimo_toast(page),
+            f'{ncards0}->{n1}, badge={badge}, atendimento 36={at36}, cabeçalho="{evo_txt.splitlines()[-4:]}", {s}')
+        btn = page.locator('#conteudo button', has_text='+ Nova evolução'); btn.click(); page.wait_for_timeout(100)
+        campo_modal(page, 'Evolução *').fill('Sem dente QA'); campo_modal(page, 'Conduta *').fill('Orientação QA'); salvar_modal(page, 200)
+        rec('EVO-06', 'Prontuário', 'Evolução sem dente (opcional) é aceita', page.evaluate("db.prontuarios.some(r=>r.descricao==='Sem dente QA' && r.dente==='—')"), 'ok')
+        # histórico de consultas: próximas 10 + últimas 30
+        nota = page.locator('#conteudo p', has_text='Próximas 10').count()
+        datas = page.eval_on_selector_all('#conteudo .card:has(h3:text("Histórico de consultas")) tbody tr td:first-child', 'e=>e.map(x=>x.textContent)')
+        iso_ = [x[6:] + '-' + x[3:5] + '-' + x[:2] for x in datas]
+        hoje = page.evaluate('HOJE')
+        fut = [x for x in iso_ if x > hoje]; pas = [x for x in iso_ if x <= hoje]
+        exp_fut = page.evaluate("db.agendamentos.filter(a=>a.paciente_id===1 && a.data>HOJE).map(a=>a.data).sort().slice(0,10)")
+        rec('EVO-07', 'Prontuário', 'Histórico de consultas: as 10 próximas (mais próximas) + até 30 realizadas', nota == 1 and len(fut) == 10 and sorted(fut) == sorted(exp_fut) and 0 < len(pas) <= 30,
+            f'linhas={len(iso_)}, futuras={len(fut)} {fut[:3]}..., passadas={len(pas)}, esperado fut={exp_fut[:3]}...')
+    safe('EVO', 'Prontuário', 'evolucao', t_evolucao)
+
+    # ================= 7. FINANCEIRO / ESTOQUE / RELATÓRIOS =================
+    def t_fin():
+        nav(page, 'Financeiro')
+        kpi = lambda lbl: page.locator('#conteudo .kpis .card', has=page.locator('.kpi-lbl', has_text=lbl)).locator('.kpi-val').inner_text()
+        k0 = kpi('Recebido')
+        page.click('text=+ Novo lançamento'); page.wait_for_timeout(120)
+        vmin = campo_modal(page, 'Valor (R$) *').get_attribute('min')
+        salvar_modal(page, 80); e = modal(page).locator('.msg-erro').inner_text()
+        campo_modal(page, 'Descrição *').fill('Receita teste QA'); campo_modal(page, 'Valor (R$) *').fill('150.50'); salvar_modal(page, 200)
+        k1 = kpi('Recebido')
+        rec('FIN-01', 'Financeiro', 'Obrigatórios validados', 'Descrição' in e, e)
+        rec('FIN-02', 'Financeiro', 'Receita R$150,50 atualiza KPI e lista', k0 != k1 and page.locator('#conteudo table tbody tr', has_text='Receita teste QA').count() == 1, f'{k0} -> {k1}')
+        page.click('text=+ Novo lançamento'); page.wait_for_timeout(120)
+        campo_modal(page, 'Descrição *').fill('Despesa teste QA'); campo_modal(page, 'Tipo *').select_option('Despesa'); campo_modal(page, 'Valor (R$) *').fill('80'); campo_modal(page, 'Status *').select_option('Pendente')
+        a0 = kpi('A pagar'); salvar_modal(page, 200)
+        rec('FIN-03', 'Financeiro', 'Despesa pendente atualiza "A pagar"', a0 != kpi('A pagar'), f'{a0} -> {kpi("A pagar")}')
+        res = {}
+        for f in ['Receita', 'Despesa', 'Pendente', 'Todos']:
+            page.locator('#conteudo .barra button', has_text=f).click(); page.wait_for_timeout(100)
+            res[f] = (page.eval_on_selector_all('#conteudo table tbody tr td:nth-child(5)', 'e=>[...new Set(e.map(x=>x.textContent))]'),
+                      page.eval_on_selector_all('#conteudo table tbody tr td:nth-child(7)', 'e=>[...new Set(e.map(x=>x.textContent))]'))
+        rec('FIN-04', 'Financeiro', 'Filtros', res['Receita'][0] == ['Receita'] and res['Despesa'][0] == ['Despesa'] and res['Pendente'][1] == ['Pendente'], res)
+        out = {}
+        for v in ['-50', '0']:
+            page.click('text=+ Novo lançamento'); page.wait_for_timeout(120); limpar_toasts(page)
+            campo_modal(page, 'Descrição *').fill('Valor invalido QA ' + v); campo_modal(page, 'Valor (R$) *').fill(v); salvar_modal(page, 150)
+            out[v] = (ultimo_toast(page), nmodais(page), page.evaluate(f"db.financeiro.some(f=>f.desc==='Valor invalido QA {v}')")); fechar_modais(page)
+        rec('FIN-05', 'Financeiro', 'Valor negativo e zero recusados', all('maior que zero' in x[0] and not x[2] for x in out.values()), f'{out}, input min={vmin}')
+    safe('FIN', 'Financeiro', 'financeiro', t_fin)
+
+    def t_est():
+        nav(page, 'Estoque')
+        qtd = lambda i: page.evaluate(f'db.estoque.find(x=>x.id==={i}).qtd')
+        linha = lambda nome: page.locator('#conteudo table tbody tr', has_text=nome).first
+        q0 = qtd(2); linha('Anestésico').locator('button', has_text='+').click(); q1 = qtd(2)
+        linha('Anestésico').locator('button[title="Registrar saída"]').click(); q2 = qtd(2)
+        rec('EST-01', 'Estoque', 'Botões + e −', q1 == q0 + 1 and q2 == q0, (q0, q1, q2))
+        linha('Cimento de ionômero').locator('button', has_text='Movimentar').click(); page.wait_for_timeout(100)
+        campo_modal(page, 'Tipo *').select_option('Saída'); campo_modal(page, 'Quantidade *').fill('50'); salvar_modal(page, 150); t = ultimo_toast(page)
+        campo_modal(page, 'Quantidade *').fill('0'); salvar_modal(page, 150); t0 = ultimo_toast(page)
+        campo_modal(page, 'Tipo *').select_option('Entrada'); campo_modal(page, 'Quantidade *').fill('10'); c0 = qtd(6); salvar_modal(page, 150)
+        rec('EST-02', 'Estoque', 'Movimentar: saldo insuficiente/zero bloqueados, entrada soma', 'insuficiente' in t and 'maior que zero' in t0 and qtd(6) == c0 + 10, (t, t0, c0, qtd(6)))
+        page.click('text=+ Novo item'); page.wait_for_timeout(100)
+        for k, v in [('Nome do item *', 'Item QA2'), ('Unidade *', 'cx'), ('Custo unitário (R$) *', '10'), ('Quantidade inicial *', '5'), ('Estoque mínimo *', '2')]:
+            campo_modal(page, k).fill(v)
+        salvar_modal(page, 150)
+        rec('EST-03', 'Estoque', 'Cadastrar item com movimento inicial', page.locator('#conteudo table tbody tr', has_text='Item QA2').count() == 1 and page.evaluate("db.movEstoque.some(m=>m.item==='Item QA2')"), 'ok')
+    safe('EST', 'Estoque', 'estoque', t_est)
+
+    def t_rel():
+        nav(page, 'Relatórios')
+        for i, a in enumerate(['Diário', 'Semanal', 'Mensal', 'Anual', 'Estoque', 'Imposto de Renda']):
+            n0 = len(ERROS)
+            page.locator('#conteudo .barra button', has_text=a).first.click(); page.wait_for_timeout(200)
+            ativo = page.locator('#conteudo .barra button.btn-primary').first.inner_text()
+            rec(f'REL-{i+1:02d}', 'Relatórios', f'Aba {a} sem erro', ativo == a and len(ERROS) == n0, f'{ativo}, {shot(page, f"07_rel_{i}")}')
+        page.locator('#conteudo .barra button', has_text='Diário').first.click(); page.wait_for_timeout(150)
+        di = page.locator('#conteudo input[type=date]').first; di.fill('2026-10-15'); di.dispatch_event('change'); page.wait_for_timeout(200)
+        h = page.locator('#conteudo .card h3', has_text='Relatório diário').inner_text()
+        rec('REL-07', 'Relatórios', 'Diário em 15/10/2026', '15/10/2026' in h, h)
+        p0 = page.evaluate('window.__prints'); page.locator('#conteudo button', has_text='Imprimir / Salvar PDF').click()
+        rec('REL-08', 'Relatórios', 'Imprimir chama print (stub)', page.evaluate('window.__prints') == p0 + 1, 'ok')
+        page.locator('#conteudo .barra button', has_text='Imposto de Renda').first.click(); page.wait_for_timeout(150)
+        page.locator('#conteudo button', has_text='Gerar agora').click(); page.wait_for_timeout(200)
+        rec('REL-09', 'Relatórios', 'IR: Gerar agora', 'gerado' in ultimo_toast(page) and page.locator('#conteudo h3', has_text='Fechamentos já gerados').count() == 1, ultimo_toast(page))
+        page.locator('#conteudo .barra button', has_text='Diário').first.click()
+    safe('REL', 'Relatórios', 'relatorios', t_rel)
+
+    def t_resp():
+        res = {}
+        for nome in ['Dashboard', 'Pacientes', 'Agenda', 'Prontuário', 'Financeiro', 'Estoque', 'Relatórios', 'Usuários']:
+            nav(page, nome); res[nome] = overflow(page)['sw']
+        rec('RESP-01', 'Responsividade', '1280px: nenhuma tela com overflow horizontal', all(v <= 1281 for v in res.values()), res)
+    safe('RESP', 'Responsividade', 'desktop', t_resp)
+
+    # ================= 8. USUÁRIOS (admin) =================
+    def t_usuarios():
+        nav(page, 'Usuários')
+        linha = page.locator('#conteudo table tbody tr', has_text='Fernanda')
+        linha.locator('button', has_text='Bloquear').click(); page.wait_for_timeout(150)
+        bloq = page.evaluate("db.usuarios.find(u=>u.paciente_id===5).ativo")
+        rec('USU-01', 'Usuários', 'Bloquear conta de paciente (Fernanda)', bloq is False, f'ativo={bloq}')
+        # trocar senha do admin e voltar
+        pw = page.locator('#conteudo input[type=password]')
+        pw.nth(0).fill('errada'); pw.nth(1).fill('nova1234'); pw.nth(2).fill('nova1234')
+        page.locator('#conteudo button', has_text='Alterar senha do administrador').click()
+        page.wait_for_function("document.querySelector('#conteudo .msg-erro:not(.hidden), #conteudo .msg-ok')", timeout=8000)
+        m1 = page.locator('#conteudo .msg-erro, #conteudo .msg-ok').first.inner_text()
+        pw.nth(0).fill(SENHA); pw.nth(1).fill('nova1234'); pw.nth(2).fill('nova1234')
+        page.locator('#conteudo button', has_text='Alterar senha do administrador').click()
+        page.wait_for_function("document.querySelector('#conteudo .msg-ok')", timeout=8000)
+        m2 = page.locator('#conteudo .msg-ok').inner_text()
+        page.click('#btn-sair-adm'); page.wait_for_timeout(150)
+        login(page, 'adminds', SENHA); antiga = logado(page)
+        login(page, 'adminds', 'nova1234'); nova = logado(page)
+        rec('USU-02', 'Usuários', 'Trocar senha do admin: senha atual errada recusada; nova senha passa a valer e a antiga não', 'incorreta' in m1 and 'sucesso' in m2 and not antiga and nova, f'"{m1}" / "{m2}", antiga entra={antiga}, nova entra={nova}')
+        # volta a senha original para os demais testes
+        nav(page, 'Usuários')
+        pw = page.locator('#conteudo input[type=password]')
+        pw.nth(0).fill('nova1234'); pw.nth(1).fill(SENHA); pw.nth(2).fill(SENHA)
+        page.locator('#conteudo button', has_text='Alterar senha do administrador').click()
+        page.wait_for_function("document.querySelector('#conteudo .msg-ok')", timeout=8000)
+    safe('USU', 'Usuários', 'usuarios', t_usuarios)
+
+    # ================= 9. PORTAL DO PACIENTE (caminho real) =================
+    def portal_login(cpf, senha):
+        page.fill('#painel-login input[type=text]', cpf); page.fill('#painel-login input[type=password]', senha)
+        page.click('#painel-login button[type=submit]'); page.wait_for_timeout(200)
+        return page.locator('#painel-login .msg-erro').inner_text() if page.locator('#painel-login .msg-erro').count() else ''
+
+    def t_portal():
+        page.click('#btn-sair-adm'); page.wait_for_timeout(150)
+        cobre = page.evaluate("(() => { const b = document.querySelector('#btn-portal').getBoundingClientRect(); const e = document.elementFromPoint(b.x+b.width/2, b.y+b.height/2); return e && e.id; })()")
+        page.click('#btn-portal'); page.wait_for_timeout(200)
+        ts = page.evaluate("getComputedStyle(document.querySelector('#tela-senha')).display")
+        tl = page.is_visible('#tela-login'); aba = page.locator('#aba-pac').get_attribute('class')
+        s = shot(page, '08_portal_login')
+        rec('POR-01', 'Portal', 'Botão real "Sou paciente" na tela de acesso abre o login do portal na aba do paciente', cobre == 'btn-portal' and ts == 'none' and tl and 'ativa' in aba,
+            f'elemento no ponto do botão={cobre}, tela-senha display={ts}, tela-login visível={tl}, aba-pac class="{aba}", {s}')
+        page.click('#aba-adm'); page.wait_for_timeout(150)
+        v = page.is_visible('#tela-senha')
+        cob = page.evaluate("(() => { const b = document.querySelector('#senha-btn').getBoundingClientRect(); const e = document.elementFromPoint(b.x+b.width/2, b.y+b.height/2); return e && e.id; })()")
+        rec('POR-02', 'Portal', '"Sou da clínica" volta para #tela-senha (clicável)', v and cob == 'senha-btn', f'tela-senha visível={v}, ponto do Entrar={cob}')
+        page.click('#btn-portal'); page.wait_for_timeout(150)
+        e1 = portal_login('111.222.333-01', '00000000'); e2 = portal_login('999.999.999-99', '1'); e3 = portal_login('', '')
+        rec('POR-03', 'Portal', 'Erros de login do portal: mensagem genérica igual para senha errada e CPF inexistente; vazio pede CPF', 'incorretos' in e1 and e1 == e2 and 'Informe' in e3, (e1, e2, e3))
+        e4 = portal_login('111.222.333-05', '18091995')
+        rec('POR-04', 'Portal', 'Conta bloqueada pelo admin não entra no portal', 'bloqueada' in e4 and not page.is_visible('#tela-portal'), e4)
+        portal_login('11122233301', '14/03/1990')
+        dentro = page.is_visible('#tela-portal'); h1 = page.inner_text('#portal-conteudo h1') if dentro else ''
+        rec('POR-05', 'Portal', 'Login com CPF só dígitos e senha 14/03/1990 entra', dentro and 'Ana' in h1, shot(page, '08_portal_inicio'))
+        n0 = page.evaluate('db.agendamentos.length')
+        page.locator('#portal-conteudo .opcao', has_text='Limpeza').click(); page.wait_for_timeout(100)
+        page.locator('#portal-conteudo .opcao', has_text='Camila').click(); page.wait_for_timeout(100)
+        inp = page.locator('#portal-conteudo input[type=date]'); mn = inp.get_attribute('min')
+        inp.fill('2026-10-11'); inp.dispatch_event('change'); page.wait_for_timeout(150)
+        dom = page.locator('#portal-conteudo .aviso', has_text='domingos').count()
+        inp = page.locator('#portal-conteudo input[type=date]'); inp.fill('2026-10-13'); inp.dispatch_event('change'); page.wait_for_timeout(150)
+        dis = page.locator('#portal-conteudo .hora-btn[disabled]').all_inner_texts()
+        ocup = page.evaluate("db.agendamentos.filter(a=>a.data==='2026-10-13'&&a.profissional_id===1&&a.status!=='Cancelado').map(a=>a.hora).sort()")
+        rec('POR-06', 'Portal', 'Data mínima amanhã, domingo bloqueado', mn == page.evaluate('maisDias(1)') and dom == 1, (mn, dom))
+        rec('POR-07', 'Portal', 'Horários com consulta do profissional desabilitados', set(ocup) <= set(dis), f'desabilitados={dis}, inícios ocupados={ocup}')
+        livre = page.locator('#portal-conteudo .hora-btn:not([disabled])')
+        horas = livre.all_inner_texts()
+        choques_ofertados = page.evaluate(f"""(() => {{ const r=[]; for (const h of {json.dumps(horas)}) {{ const c = choqueAgenda('2026-10-13', h, 2, 0, 1); if (c) r.push(h + ' choca com ' + c.hora + '(' + duracaoProc(c.proc) + 'min)'); }} return r; }})()""")
+        hora = horas[0]; livre.first.click(); page.wait_for_timeout(120)
+        page.locator('#portal-conteudo .opcao', has_text='Cartão').click(); page.wait_for_timeout(120)
+        page.locator('#portal-conteudo select').nth(1).select_option('3'); page.wait_for_timeout(120)
+        conf_div = page.locator('#portal-conteudo .aviso', has_text='ocupado').count()
+        btn_dis = page.locator('#portal-conteudo button', has_text='Confirmar agendamento').get_attribute('disabled')
+        page.locator('#portal-conteudo button', has_text='Confirmar agendamento').click(); page.wait_for_timeout(200)
+        av = modal(page).inner_text() if nmodais(page) else ''
+        novo = page.evaluate("db.agendamentos[db.agendamentos.length-1]")
+        choque = page.evaluate(f"(() => {{ const a = db.agendamentos[db.agendamentos.length-1]; return choqueAgenda(a.data, a.hora, a.proc, a.cadeira_id, a.profissional_id, a.id); }})()")
+        s = shot(page, '08_portal_confirmado')
+        rec('POR-08', 'Portal', 'Agendamento pelo portal gravado (cartão 3x) sem choque por duração', page.evaluate('db.agendamentos.length') == n0 + 1 and novo['origem'] == 'Portal do paciente' and novo['parcelas'] == 3 and 'confirmada' in av and choque is None,
+            f'hora={hora}, aviso conflito antes={conf_div}, btn disabled={btn_dis}, registro={novo}, choque={choque}, {s}')
+        # horário ofertado pelo portal respeita duração? verificar se algum horário habilitado gera choque
+        rec('POR-09', 'Portal', 'Portal não oferece horário que se sobrepõe (por duração) a consulta do mesmo profissional', not choques_ofertados,
+            f'horários habilitados que chocam por duração: {choques_ofertados} (horariosLivres, linha ~2938, compara só a hora de início)', 'media')
+        page.keyboard.press('Escape'); page.wait_for_timeout(200)
+        reset = page.evaluate("novoAg.proc === null"); tela = page.inner_text('#portal-conteudo h1')
+        msgocup = page.locator('#portal-conteudo .aviso', has_text='ocupado').count()
+        rec('POR-10', 'Portal', 'Fechar o aviso "Consulta confirmada" com Esc leva a "Minhas consultas" (mesmo efeito do botão Entendi)', reset and 'Minhas consultas' in tela,
+            f'novoAg resetado={reset}, tela="{tela}", aviso "horário ocupado" exibido={msgocup}. O Esc global (linha ~3307) remove o .modal-bg sem chamar aoFechar de abrirAviso', 'baixa')
+        if not ('Minhas consultas' in tela):
+            page.locator('#portal-nav button', has_text='Minhas consultas').click(); page.wait_for_timeout(150)
+        card = page.locator('#portal-conteudo .card', has_text='13/10/2026').filter(has_text=hora).first
+        b = card.locator('button.btn-perigo'); b.click(); page.wait_for_timeout(120)
+        t1 = b.inner_text(); st1 = page.evaluate(f"db.agendamentos.find(a=>a.id==={novo['id']}).status")
+        b.click(); page.wait_for_timeout(200)
+        st2 = page.evaluate(f"db.agendamentos.find(a=>a.id==={novo['id']}).status")
+        fin = page.evaluate(f"db.financeiro.filter(f=>f.agendamento_id==={novo['id']}).length")
+        rec('POR-11', 'Portal', 'Cancelar exige segundo clique ("Confirmar cancelamento") e remove o lançamento pendente',
+            t1 == 'Confirmar cancelamento' and st1 != 'Cancelado' and st2 == 'Cancelado' and fin == 0, f'1º clique="{t1}" status={st1}; 2º: status={st2}, lançamentos restantes={fin}')
+        card2 = page.locator('#portal-conteudo .card').filter(has=page.locator('button.btn-perigo')).first
+        b2 = card2.locator('button.btn-perigo'); b2.click(); page.wait_for_timeout(5400)
+        rec('POR-12', 'Portal', 'Confirmação de cancelamento expira após 5 s (volta a "Cancelar")', b2.inner_text() == 'Cancelar', b2.inner_text())
+        page.locator('#portal-nav button', has_text='Meus dados').click(); page.wait_for_timeout(120)
+        pw = page.locator('#portal-conteudo input[type=password]')
+        pw.nth(0).fill('14031990'); pw.nth(1).fill('nova123'); pw.nth(2).fill('nova123')
+        page.locator('#portal-conteudo button', has_text='Alterar senha').click(); page.wait_for_timeout(120)
+        rec('POR-13', 'Portal', 'Meus dados: trocar senha', page.evaluate('db.usuarios[0].senha') == 'nova123', page.locator('#portal-conteudo .msg-ok, #portal-conteudo .msg-erro').first.inner_text())
+        page.locator('#portal-nav button', has_text='Sair').click(); page.wait_for_timeout(150)
+        rec('POR-14', 'Portal', 'Sair do portal volta à #tela-senha', page.is_visible('#tela-senha') and not page.is_visible('#tela-login'), 'ok')
+        # criar conta (Maria Clara, id 3, sem conta, nasc 2001-11-05)
+        page.click('#btn-portal'); page.wait_for_timeout(120)
+        page.locator('#painel-login button.link', has_text='Criar minha conta').click(); page.wait_for_timeout(100)
+        f = page.locator('#painel-login form input')
+        def cadastro(nome, cpf, nasc):
+            f.nth(0).fill(nome); f.nth(1).fill(cpf); f.nth(2).fill(nasc)
+            page.locator('#painel-login form button[type=submit]').click(); page.wait_for_timeout(150)
+            return page.locator('#painel-login .msg-erro').inner_text() if page.locator('#painel-login .msg-erro').count() else ''
+        m = cadastro('Impostor', '111.222.333-03', '1990-01-01')
+        nconta = page.evaluate("db.usuarios.filter(u=>u.paciente_id===3).length")
+        vaz = '2001' in m or '05112001' in m
+        rec('POR-15', 'Portal', 'Criar conta com CPF existente e nascimento errado é recusado sem revelar a data', 'Não foi possível' in m and nconta == 0 and not vaz and not nmodais(page), f'msg="{m}", contas={nconta}')
+        m = cadastro('Maria Clara Rodrigues', '111.222.333-03', '2001-11-05')
+        av = modal(page).inner_text() if nmodais(page) else ''
+        rec('POR-16', 'Portal', 'Criar conta com CPF existente e nascimento correto vincula ao paciente', 'Conta criada' in av and page.evaluate("db.usuarios.filter(u=>u.paciente_id===3).length") == 1, av[:80].replace('\n', ' '))
+        if nmodais(page): page.locator('#modais button', has_text='Entendi').click(); page.wait_for_timeout(200)
+        if page.is_visible('#tela-portal'): page.locator('#portal-nav button', has_text='Sair').click(); page.wait_for_timeout(150)
+        # esqueci senha
+        page.click('#btn-portal'); page.wait_for_timeout(120)
+        page.locator('#painel-login button.link', has_text='Esqueci').click(); page.wait_for_timeout(100)
+        f1 = page.locator('#painel-login form').nth(0)
+        def esqueci(cpf, nasc):
+            f1.locator('input').nth(0).fill(cpf); f1.locator('input').nth(1).fill(nasc); f1.locator('button').click(); page.wait_for_timeout(120)
+            return f1.locator('.msg-erro').inner_text() if f1.locator('.msg-erro').count() else ''
+        ma = esqueci('111.222.333-02', '1999-01-01'); mb = esqueci('999.999.999-99', '1999-01-01')
+        rec('POR-17', 'Portal', 'Esqueci senha: mensagem genérica igual para CPF inexistente e data errada', ma == mb and 'não conferem' in ma, (ma, mb))
+        mc = esqueci('111.222.333-05', '1995-09-18')
+        ativo = page.evaluate("db.usuarios.find(u=>u.paciente_id===5).ativo")
+        rec('POR-18', 'Portal', 'Esqueci senha não reativa conta bloqueada', 'bloqueada' in mc and ativo is False and not nmodais(page), f'msg="{mc}", ativo={ativo}')
+        f2 = page.locator('#painel-login form').nth(1)
+        f2.locator('input').fill('111.222.333-02'); f2.locator('button').click(); page.wait_for_timeout(120)
+        mp = f2.locator('.msg-ok').inner_text() if f2.locator('.msg-ok').count() else ''
+        page.click('#aba-adm'); page.wait_for_timeout(120)
+        limpar_toasts(page)
+        login(page)
+        ts_ = todos_toasts(page)
+        badge = page.locator('#nav button.nav-link', has_text='Usuários').inner_text()
+        rec('POR-19', 'Portal', 'Pedido de senha gera toast no login do admin e badge no menu Usuários', any('pedido(s) de senha' in x for x in ts_) and '1' in badge, f'pedido="{mp}", toasts={ts_}, menu="{badge}"')
+        nav(page, 'Usuários')
+        page.locator('#conteudo button', has_text='Gerar senha provisória').click(); page.wait_for_timeout(150)
+        prov = modal(page).locator('.pix-box').inner_text() if nmodais(page) else ''
+        page.locator('#modais button', has_text='Entendi').click()
+        u = page.evaluate("db.usuarios.find(u=>u.paciente_id===2)")
+        rec('POR-20', 'Portal', 'Admin gera senha provisória para o pedido', len(prov) == 8 and u['temporaria'] and u['senha'] == prov and page.evaluate("db.pedidosSenha[0].status") == 'Atendido', f'provisória={prov}')
+        nav(page, 'Financeiro')
+        sts = page.eval_on_selector_all('#conteudo table tbody tr td:nth-child(7)', 'e=>[...new Set(e.map(x=>x.textContent))]')
+        rec('POR-21', 'Portal', 'Financeiro sem status "Cancelado" vindo do portal', 'Cancelado' not in sts, sts)
+    safe('POR', 'Portal', 'portal', t_portal)
+    ctx.close()
+
+    # ================= 10. MOBILE 375 =================
+    ctxm, pm = nova_pagina(browser, 375, 812, 'mobile')
+    def t_mobile():
+        o = overflow(pm)
+        bp = pm.evaluate("(() => { const r = document.querySelector('#btn-portal').getBoundingClientRect(); return [r.left, r.right, r.bottom, innerHeight]; })()")
+        rec('MOB-01', 'Mobile 375', 'Tela de acesso sem overflow e botão do portal visível', o['sw'] <= 376 and bp[1] <= 375 and bp[2] <= bp[3], f'{o}, btn-portal={bp}, {shot(pm, "09_mobile_login")}')
+        login(pm)
+        res = {}
+        for vid in ['dashboard', 'pacientes', 'agenda', 'prontuario', 'financeiro', 'estoque', 'relatorios', 'usuarios']:
+            pm.evaluate(f"irPara('{vid}')"); pm.wait_for_timeout(150); res[vid] = overflow(pm)['sw']
+            shot(pm, f'09_mobile_{vid}', True)
+        rec('MOB-02', 'Mobile 375', 'Nenhuma tela com overflow horizontal em 375px', all(v <= 376 for v in res.values()), res)
+        navb = pm.evaluate("[...document.querySelectorAll('#nav button, #btn-sair-adm')].map(b=>{const r=b.getBoundingClientRect(); return [b.textContent.trim(), Math.round(r.left), Math.round(r.right)]})")
+        rec('MOB-03', 'Mobile 375', 'Itens do menu (9 + Sair) dentro da viewport', len(navb) == 10 and all(x[1] >= 0 and x[2] <= 376 for x in navb), navb)
+        pm.locator('#nav button', has_text='Pacientes').click(); pm.wait_for_timeout(150)
+        rec('MOB-04', 'Mobile 375', 'Navegar pelo menu tocando no item (Pacientes)', pm.inner_text('#conteudo h1') == 'Pacientes', 'ok')
+        pm.evaluate("irPara('prontuario')"); pm.wait_for_timeout(200)
+        b = pm.evaluate("(() => { const s = document.querySelector('svg.odt3d-svg').getBoundingClientRect(); return {l:s.left, r:s.right, w:s.width}; })()")
+        fora = pm.evaluate("[...document.querySelectorAll('g.odt3d-dente')].map(g=>g.getBoundingClientRect()).filter(r=>r.left<0||r.right>innerWidth).length")
+        pm.locator('.odt3d-stage').scroll_into_view_if_needed()
+        rec('MOB-05', 'Mobile 375', 'SVG do odontograma cabe na tela e nenhum dente fica fora', b['l'] >= 0 and b['r'] <= 375.5 and fora == 0, f'{b}, fora={fora}, {shot(pm, "09_mobile_odonto")}')
+        pm.locator('g.odt3d-dente').nth(5).click(); pm.wait_for_timeout(150)
+        mb = pm.evaluate("(() => { const m = document.querySelector('#modais .modal'); if(!m) return null; const r = m.getBoundingClientRect(); return {l:r.left, r:r.right}; })()")
+        if mb:
+            pm.locator('#modais .modal .odt-opt', has_text='Cárie').click(); pm.locator('#modais .modal button', has_text='Salvar').click(); pm.wait_for_timeout(150)
+        rec('MOB-06', 'Mobile 375', 'Modal do dente cabe e salva', mb is not None and mb['l'] >= 0 and mb['r'] <= 375.5 and pm.evaluate("Object.values((db.odontograma||{})[1]||{}).some(v=>v.estado==='carie')"), mb)
+        pm.locator('.odt-toolbar button', has_text='Ver em grade').click(); pm.wait_for_timeout(150)
+        o = overflow(pm)
+        rec('MOB-07', 'Mobile 375', 'Grade do odontograma sem overflow', o['sw'] <= 376, f'{o}, {shot(pm, "09_mobile_grade", True)}')
+        pm.locator('.odt-toolbar button', has_text='Ver arcada 3D').click(); pm.wait_for_timeout(100)
+        pm.locator('#conteudo button', has_text='+ Nova evolução').click(); pm.wait_for_timeout(150)
+        me = pm.evaluate("(() => { const m = document.querySelector('#modais .modal').getBoundingClientRect(); return [m.left, m.right]; })()")
+        pm.keyboard.press('Escape')
+        rec('MOB-08', 'Mobile 375', 'Modal "Nova evolução" cabe em 375px', me[0] >= 0 and me[1] <= 375.5, me)
+        pm.click('#btn-sair-adm'); pm.wait_for_timeout(150); pm.click('#btn-portal'); pm.wait_for_timeout(150)
+        pm.fill('#painel-login input[type=text]', '111.222.333-01'); pm.fill('#painel-login input[type=password]', '14031990')
+        pm.click('#painel-login button[type=submit]'); pm.wait_for_timeout(200)
+        o = overflow(pm)
+        rec('MOB-09', 'Mobile 375', 'Portal do paciente em 375px sem overflow', pm.is_visible('#tela-portal') and o['sw'] <= 376, f'{o}, {shot(pm, "09_mobile_portal", True)}')
+    safe('MOB', 'Mobile 375', 'mobile', t_mobile)
+    ctxm.close()
+
+    def t_portal_extra():
+        c3, p3 = nova_pagina(browser, tag='portal-extra')
+        p3.click('#btn-portal'); p3.wait_for_timeout(150)
+        p3.fill('#painel-login input[type=text]', '111.222.333-01'); p3.fill('#painel-login input[type=password]', '14031990')
+        p3.click('#painel-login button[type=submit]'); p3.wait_for_timeout(200)
+        # cenário independente da data: próxima terça-feira livre com Restauração (60 min) às 14:00 da Dra. Camila
+        dia = p3.evaluate("""(() => { let d = 1; while (true) { const x = maisDias(d); if (dataDe(x).getDay() === 2) {
+            db.agendamentos = db.agendamentos.filter(a => !(a.data === x && a.profissional_id === 1));
+            db.agendamentos.push({id:proxId(db.agendamentos), paciente_id:2, profissional_id:1, cadeira_id:1, data:x, hora:'14:00',
+              proc:3, status:'Agendado', forma:null, pago:false, origem:'Recepção'}); return x; } d++; } })()""")
+        p3.evaluate("irPortal('novo')"); p3.wait_for_timeout(100)
+        p3.locator('#portal-conteudo .opcao', has_text='Limpeza').click(); p3.locator('#portal-conteudo .opcao', has_text='Camila').click()
+        i = p3.locator('#portal-conteudo input[type=date]'); i.fill(dia); i.dispatch_event('change'); p3.wait_for_timeout(100)
+        dis1330 = p3.locator('#portal-conteudo .hora-btn', has_text='13:30').get_attribute('disabled')
+        n0 = p3.evaluate('db.agendamentos.length')
+        p3.evaluate(f"novoAg = {{proc:2, prof:1, data:'{dia}', hora:'13:30', forma:'Pix', cartao:null, parcelas:1}}; confirmarAgendamento();")
+        p3.wait_for_timeout(150)
+        n1 = p3.evaluate('db.agendamentos.length')
+        rec('POR-22', 'Portal', 'Portal não oferece nem grava consulta sobreposta por duração (Limpeza 45 min às 13:30 x Restauração 60 min às 14:00, Dra. Camila)',
+            dis1330 is not None and n1 == n0, f'botão 13:30 desabilitado={dis1330 is not None}, agendamentos antes={n0} depois={n1}')
+        c3.close()
+    safe('POR-22', 'Portal', 'portal extra', t_portal_extra)
+
+    # ================= v5.0: RH, comissões, totais, ganhos e contracheque =================
+    def t_v5():
+        c5, p5 = nova_pagina(browser, tag='v5')
+        login(p5)
+        # menu e tela de RH
+        nav(p5, 'RH')
+        h1 = p5.inner_text('#conteudo h1')
+        ncol = p5.locator('#conteudo table tbody tr').count()
+        rec('V5-01', 'RH', 'Menu RH abre a tela com a lista de colaboradores', h1 == 'RH' and ncol == p5.evaluate('db.colaboradores.length'), f'h1={h1}, linhas={ncol}')
+        dent = p5.evaluate("db.colaboradores.filter(c => c.cargo === 'Dentista').map(c => c.comissao)")
+        rec('V5-02', 'RH', 'Dentistas cadastrados com comissão padrão de 25%', len(dent) >= 3 and all(x == 25 for x in dent), dent)
+        # novo dentista entra na agenda
+        n0 = p5.evaluate('db.profissionais.length')
+        p5.locator('button', has_text='+ Novo colaborador').click(); p5.wait_for_timeout(120)
+        campo_modal(p5, 'Nome completo *').fill('Dr. Teste Comissao')
+        modal(p5).locator('button', has_text='Salvar').click(); p5.wait_for_timeout(150)
+        novo = p5.evaluate("db.colaboradores.find(c => c.nome === 'Dr. Teste Comissao')")
+        rec('V5-03', 'RH', 'Novo colaborador dentista é cadastrado com 25% e incluído na agenda',
+            novo and novo['comissao'] == 25 and novo['profissional_id'] and p5.evaluate('db.profissionais.length') == n0 + 1, novo)
+        # validação de comissão inválida
+        p5.locator('button', has_text='+ Novo colaborador').click(); p5.wait_for_timeout(120)
+        campo_modal(p5, 'Nome completo *').fill('Comissao Invalida')
+        campo_modal(p5, 'Comissão (%)').fill('150')
+        modal(p5).locator('button', has_text='Salvar').click(); p5.wait_for_timeout(150)
+        aberto = p5.locator('#modais .modal-bg').count() > 0
+        rec('V5-04', 'RH', 'Comissão acima de 100% é recusada', aberto and not p5.evaluate("db.colaboradores.some(c => c.nome === 'Comissao Invalida')"), f'modal aberto={aberto}')
+        p5.keyboard.press('Escape')
+        # regra da comissão: 25% sobre atendimentos concluídos e pagos
+        chk = p5.evaluate("""(() => { const ini = '2026-09-01', fim = '2026-09-30'; const r = comissoesEntre(ini, fim);
+            const esperado = db.agendamentos.filter(a => a.status === 'Concluído' && a.pago && a.data >= ini && a.data <= fim)
+              .reduce((s, a) => s + proce(a.proc).valor, 0);
+            return {producao:r.producao, esperado:esperado, comissao:r.comissao, quarto:Math.round(esperado * 25) / 100}; })()""")
+        rec('V5-05', 'RH', 'Comissão = 25% da produção concluída e paga do período', abs(chk['producao'] - chk['esperado']) < 0.01 and abs(chk['comissao'] - chk['quarto']) < 0.05, chk)
+        # totais dos relatórios: líquido = recebido - despesas - comissões
+        for aba, ini, fim in [('diario', '2026-09-29', '2026-09-29'), ('semanal', '2026-09-28', '2026-10-04'),
+                              ('mensal', '2026-09-01', '2026-09-30'), ('anual', '2026-01-01', '2026-12-31')]:
+            p5.evaluate(f"abaRel='{aba}'; relData='2026-09-29'; relMesRef='2026-09-01'; relAno=2026; irPara('relatorios')"); p5.wait_for_timeout(150)
+            r = p5.evaluate(f"resumoPeriodo('{ini}', '{fim}')")
+            tem = p5.locator('#conteudo .totais-periodo').count() == 1
+            txt = p5.inner_text('#conteudo .totais-periodo')
+            liq_ok = abs(r['liquido'] - (r['rec'] - r['des'] - r['com']['comissao'])) < 0.01
+            rec('V5-06-' + aba, 'Relatórios', f'Relatório {aba} mostra Totais com recebido, despesas, comissões e líquido coerentes',
+                tem and liq_ok and 'Resultado líquido' in txt, f"rec={r['rec']}, des={r['des']}, com={r['com']['comissao']}, liq={r['liquido']}")
+            totais = p5.eval_on_selector_all('#conteudo .gr-total, #conteudo .hbar-total, #conteudo tfoot', 'e => e.length')
+            rec('V5-07-' + aba, 'Relatórios', f'Relatório {aba} exibe linhas de total nos gráficos e tabelas', totais >= 3, f'totais={totais}')
+        # ganhos dos dentistas
+        p5.evaluate("abaRel='ganhos'; relMesRef='2026-09-01'; irPara('relatorios')"); p5.wait_for_timeout(200)
+        g = p5.evaluate("""(() => { const hs = db.colaboradores.filter(c => c.profissional_id).map(c => calcularHolerite(c, '2026-09'));
+            return {bruto:hs.reduce((s,h)=>s+h.bruto,0), desc:hs.reduce((s,h)=>s+h.totalDesc,0), liq:hs.reduce((s,h)=>s+h.liquido,0),
+                    com:comissoesEntre('2026-09-01','2026-09-30').comissao}; })()""")
+        rodape = p5.inner_text('#conteudo table tfoot')
+        rec('V5-08', 'Relatórios', 'Ganhos dos dentistas: bruto = comissões do mês e líquido = bruto - descontos, com total',
+            abs(g['bruto'] - g['com']) < 0.05 and abs(g['liq'] - (g['bruto'] - g['desc'])) < 0.05 and 'TOTAL' in rodape, g)
+        # cálculos de folha (tabelas 2026)
+        calc = p5.evaluate("[inssEmpregado(2300), inssEmpregado(7000), inssAutonomo(1737.5), inssAutonomo(10000), irrfMensal(4800, inssEmpregado(4800)).imposto, irrfMensal(7000, inssEmpregado(7000)).imposto]")
+        rec('V5-09', 'RH', 'INSS e IRRF 2026: valores de referência conferidos', calc == [182.69, 781.51, 191.13, 932.31, 0, 754.75], calc)
+        # contracheque
+        p5.locator('#conteudo button', has_text='Contracheque').first.click(); p5.wait_for_timeout(200)
+        cc = p5.locator('#modais .contracheque').inner_text() if p5.locator('#modais .contracheque').count() else ''
+        p5.locator('#modais button', has_text='Imprimir contracheque').click(); p5.wait_for_timeout(200)
+        prints = p5.evaluate('window.__prints')
+        rec('V5-10', 'RH', 'Contracheque abre com proventos, descontos e líquido e imprime', 'Valor líquido a receber' in cc and 'INSS' in cc and prints >= 1, f'prints={prints}')
+        p5.keyboard.press('Escape')
+        # folha do mês e lançamento no financeiro (sem duplicar)
+        p5.evaluate("abaRH='comissoes'; rhMes='2026-09'; irPara('rh')"); p5.wait_for_timeout(200)
+        f0 = p5.evaluate('db.financeiro.length')
+        p5.locator('button', has_text='Lançar folha no Financeiro').click(); p5.wait_for_timeout(150)
+        f1 = p5.evaluate('db.financeiro.length')
+        p5.locator('button', has_text='Lançar folha no Financeiro').click(); p5.wait_for_timeout(150)
+        f2 = p5.evaluate('db.financeiro.length')
+        rec('V5-11', 'RH', 'Lançar folha cria as despesas de comissão uma única vez', f1 > f0 and f2 == f1, f'antes={f0}, depois={f1}, 2º clique={f2}')
+        r = p5.evaluate("resumoPeriodo('2026-09-01', '2026-09-30')")
+        com_lanc = p5.evaluate("db.financeiro.filter(f => f.cat === 'Comissões' && f.ref && f.ref.startsWith('com:2026-09')).reduce((s,f)=>s+f.valor,0)")
+        rec('V5-12', 'Relatórios', 'Comissões lançadas no Financeiro não são somadas duas vezes no resultado', abs(com_lanc - r['com']['comissao']) < 0.05 and r['des'] < r['des'] + com_lanc, f"lançado={com_lanc}, comissão={r['com']['comissao']}, despesas operacionais={r['des']}")
+        rec('V5-13', 'RH', 'Versão 5.2 exibida no menu', 'v5.2' in p5.inner_text('aside'), p5.inner_text('aside')[:80])
+        c5.close()
+    safe('V5', 'RH', 'versao 5', t_v5)
+
+    # ================= v5.2: revisão do RH e do gerador de contracheque =================
+    def t_v52():
+        c6, p6 = nova_pagina(browser, tag='v52')
+        login(p6)
+        nav(p6, 'RH')
+        def novo_colab(dados):
+            p6.locator('button', has_text='+ Novo colaborador').click(); p6.wait_for_timeout(120)
+            for rot, val in dados:
+                cm = campo_modal(p6, rot)
+                if cm.evaluate('e => e.tagName') == 'SELECT': cm.select_option(val)
+                else: cm.fill(val)
+            modal(p6).locator('button', has_text='Salvar').click(); p6.wait_for_timeout(150)
+        # salário proporcional na admissão
+        novo_colab([('Nome completo *', 'Ana Proporcional'), ('CPF', '529.982.247-25'), ('Cargo *', 'Recepcionista'),
+                    ('Vínculo *', 'CLT'), ('Salário fixo (R$)', '3000'), ('Data de admissão *', '2026-09-15')])
+        r = p6.evaluate("""(() => { const c = db.colaboradores.find(x => x.nome === 'Ana Proporcional');
+            return c ? {cpf:c.cpf, jan:calcularHolerite(c,'2026-01').bruto, set:calcularHolerite(c,'2026-09').bruto,
+                        out:calcularHolerite(c,'2026-10').bruto} : null; })()""")
+        rec('V52-01', 'RH', 'Salário proporcional na admissão (15/09: 16 dias) e nada antes da admissão',
+            r and r['jan'] == 0 and r['set'] == 1600 and r['out'] == 3000 and r['cpf'] == '529.982.247-25', r)
+        # CPF inválido e duplicado
+        n0 = p6.evaluate('db.colaboradores.length')
+        novo_colab([('Nome completo *', 'Cpf Invalido'), ('CPF', '111.111.111-11'), ('Cargo *', 'Recepcionista'),
+                    ('Vínculo *', 'CLT'), ('Salário fixo (R$)', '2000')])
+        aberto1 = modal(p6).count() > 0; p6.keyboard.press('Escape'); p6.wait_for_timeout(80)
+        novo_colab([('Nome completo *', 'Cpf Duplicado'), ('CPF', '52998224725'), ('Cargo *', 'Recepcionista'),
+                    ('Vínculo *', 'CLT'), ('Salário fixo (R$)', '2000')])
+        aberto2 = modal(p6).count() > 0; p6.keyboard.press('Escape'); p6.wait_for_timeout(80)
+        rec('V52-02', 'RH', 'CPF inválido e CPF duplicado são recusados', aberto1 and aberto2 and p6.evaluate('db.colaboradores.length') == n0,
+            f'inválido aberto={aberto1}, duplicado aberto={aberto2}')
+        # desligamento proporcional e inativação automática
+        r = p6.evaluate("""(() => { const c = db.colaboradores.find(x => x.nome === 'Juliana Martins');
+            c.desligamento = '2026-08-10'; c.ativo = false;
+            const v = [calcularHolerite(c,'2026-07').bruto, calcularHolerite(c,'2026-08').bruto, calcularHolerite(c,'2026-09').bruto];
+            c.desligamento = null; c.ativo = true; return v; })()""")
+        rec('V52-03', 'RH', 'Desligamento em 10/08: mês cheio antes, 10 dias em agosto e nada depois', r == [2300, 766.67, 0], r)
+        p6.locator('#conteudo tr', has_text='Marcos Vieira').locator('button', has_text='Editar').click(); p6.wait_for_timeout(120)
+        campo_modal(p6, 'Situação *').select_option('nao')
+        modal(p6).locator('button', has_text='Salvar').click(); p6.wait_for_timeout(150)
+        mv = p6.evaluate("(() => { const c = db.colaboradores.find(x => x.nome === 'Marcos Vieira'); const v = {ativo:c.ativo, desl:c.desligamento, hoje:HOJE}; c.ativo = true; c.desligamento = null; return v; })()")
+        rec('V52-04', 'RH', 'Inativar sem data registra o desligamento na data de hoje', mv['ativo'] is False and mv['desl'] == mv['hoje'], mv)
+        # dependentes no IRRF
+        ir = p6.evaluate("[irrfMensal(7000, inssEmpregado(7000)).imposto, irrfMensal(7000, inssEmpregado(7000), 2).imposto]")
+        rec('V52-05', 'RH', 'Dependentes reduzem o IRRF (R$ 189,59 cada): 7.000 com 2 dependentes', ir == [754.75, 650.48], ir)
+        # valor por extenso
+        ext = p6.evaluate("[porExtenso(2117.31), porExtenso(1000), porExtenso(1.01), porExtenso(1250.75)]")
+        rec('V52-06', 'RH', 'Valor líquido por extenso', ext == ['dois mil cento e dezessete reais e trinta e um centavos', 'mil reais',
+            'um real e um centavo', 'mil duzentos e cinquenta reais e setenta e cinco centavos'], ext)
+        # contracheque completo
+        p6.evaluate("abaRH='comissoes'; rhMes='2026-09'; irPara('rh')"); p6.wait_for_timeout(200)
+        p6.locator('#conteudo tr', has_text='Ana Proporcional').locator('button', has_text='Contracheque').click(); p6.wait_for_timeout(200)
+        cc = p6.locator('#modais .contracheque').inner_text()
+        rec('V52-07', 'RH', 'Contracheque CLT traz CPF, período, salário proporcional, extenso, FGTS e prazo de pagamento',
+            all(x in cc for x in ['529.982.247-25', 'Período: 01/09/2026 a 30/09/2026', 'Salário proporcional', '16 dias',
+                                  'por extenso', 'FGTS', '5º dia útil']), cc[:400])
+        p6.keyboard.press('Escape'); p6.wait_for_timeout(80)
+        p6.locator('#conteudo tr', has_text='Dra. Camila Ferreira').locator('button', has_text='Contracheque').click(); p6.wait_for_timeout(200)
+        cc2 = p6.locator('#modais .contracheque').inner_text()
+        rec('V52-08', 'RH', 'Contracheque do dentista autônomo sai como RPA com INSS de 11% e sem FGTS',
+            'RPA' in cc2 and 'INSS contribuinte individual' in cc2 and 'FGTS' not in cc2, cc2[:300])
+        p6.keyboard.press('Escape'); p6.wait_for_timeout(80)
+        # exportação CSV
+        with p6.expect_download() as dl:
+            p6.locator('button', has_text='Exportar folha (CSV)').click()
+        caminho = dl.value.path(); txt = Path(caminho).read_text(encoding='utf-8-sig')
+        rec('V52-09', 'RH', 'Exporta a folha em CSV com cabeçalho, colaboradores e total',
+            dl.value.suggested_filename == 'folha-2026-09.csv' and txt.startswith('"Competência"') and 'Ana Proporcional' in txt and '"TOTAL"' in txt,
+            dl.value.suggested_filename + ' | ' + txt[:120])
+        # lançar folha com FGTS, sem duplicar
+        f0 = p6.evaluate("db.financeiro.filter(f => f.ref && f.ref.startsWith('fgts:2026-09')).length")
+        p6.locator('button', has_text='Lançar folha no Financeiro').click(); p6.wait_for_timeout(150)
+        f1 = p6.evaluate("db.financeiro.filter(f => f.ref && f.ref.startsWith('fgts:2026-09')).length")
+        p6.locator('button', has_text='Lançar folha no Financeiro').click(); p6.wait_for_timeout(150)
+        f2 = p6.evaluate("db.financeiro.filter(f => f.ref && f.ref.startsWith('fgts:2026-09')).length")
+        sal = p6.evaluate("db.financeiro.find(f => f.ref && f.ref.startsWith('sal:2026-09') && f.desc.indexOf('Ana Proporcional') >= 0)")
+        rec('V52-10', 'RH', 'Lançar folha inclui FGTS e o salário proporcional, sem duplicar',
+            f0 == 0 and f1 >= 4 and f2 == f1 and sal and sal['valor'] == 1600, f'fgts: {f0}->{f1}->{f2}, salário={sal and sal["valor"]}')
+        # busca e filtro
+        p6.evaluate("abaRH='colaboradores'; irPara('rh')"); p6.wait_for_timeout(150)
+        p6.fill('#rh-busca', 'renata'); p6.wait_for_timeout(100)
+        n_b = p6.locator('#conteudo table tbody tr').count()
+        p6.fill('#rh-busca', '529982'); p6.wait_for_timeout(100)
+        n_c = p6.locator('#conteudo table tbody tr').count()
+        p6.fill('#rh-busca', ''); p6.select_option('#rh-situacao', 'inativos'); p6.wait_for_timeout(100)
+        n_i = p6.locator('#conteudo table tbody tr').count()
+        p6.select_option('#rh-situacao', 'ativos')
+        rec('V52-11', 'RH', 'Busca por nome e CPF e filtro por situação', n_b == 1 and n_c == 1 and n_i == 0, f'nome={n_b}, cpf={n_c}, inativos={n_i}')
+        # mudar cargo para Dentista inclui na agenda
+        np0 = p6.evaluate('db.profissionais.length')
+        p6.locator('#conteudo tr', has_text='Ana Proporcional').locator('button', has_text='Editar').click(); p6.wait_for_timeout(120)
+        campo_modal(p6, 'Cargo *').select_option('Dentista')
+        modal(p6).locator('button', has_text='Salvar').click(); p6.wait_for_timeout(150)
+        ana = p6.evaluate("db.colaboradores.find(x => x.nome === 'Ana Proporcional')")
+        rec('V52-12', 'RH', 'Editar o cargo para Dentista inclui o colaborador na Agenda',
+            ana['profissional_id'] and p6.evaluate('db.profissionais.length') == np0 + 1, ana)
+        # comissão pelo valor cobrado, mesmo se a tabela de preços mudar depois
+        r = p6.evaluate("""(() => { const a = db.agendamentos.find(x => x.status === 'Agendado' || x.status === 'Confirmado');
+            const p = proce(a.proc), antes = p.valor; a.status = 'Concluído'; a.pago = true; a.valor = antes;
+            const ini = a.data.slice(0, 8) + '01', fim = a.data.slice(0, 8) + '31';
+            const c1 = comissoesEntre(ini, fim).comissao; p.valor = antes + 100; const c2 = comissoesEntre(ini, fim).comissao;
+            p.valor = antes; return {c1:c1, c2:c2}; })()""")
+        rec('V52-13', 'RH', 'Comissão usa o valor cobrado e não muda se o preço do procedimento for alterado depois', abs(r['c1'] - r['c2']) < 0.001, r)
+        c6.close()
+    safe('V52', 'RH', 'versao 5.2', t_v52)
+
+    rec('ERR-01', 'Carregamento', 'Nenhum pageerror/console error na execução inteira (exceto imagens ausentes)', not ERROS, ERROS[:10])
+    browser.close()
+
+Path(OUT / 'resultados.json').write_text(json.dumps(RES, ensure_ascii=False, indent=1))
+tot = len(RES); ok = sum(r['resultado'] == 'PASSOU' for r in RES)
+print(f'\nTOTAL={tot} PASSOU={ok} FALHOU={tot-ok}')

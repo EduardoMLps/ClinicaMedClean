@@ -1,0 +1,76 @@
+# =====================================================================
+# Med Flow - composicao de PRODUCAO (padrao)
+#
+#   docker compose up -d --build
+#
+# - Sobe SEM dados de demonstracao e SEM senha padrao (correcao B1).
+#   Depois do primeiro "up", defina a senha do administrador com:
+#     docker compose exec backend flask --app wsgi definir-senha-admin
+# - Apenas o frontend (nginx) fica exposto. MySQL e API so sao acessiveis
+#   pela rede interna do Docker (correcao B7).
+# - Para HTTPS, veja frontend/nginx-https.conf.exemplo e docs/SECURITY.md.
+#
+# Para testes locais COM dados ficticios, use o arquivo extra de demo:
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
+# =====================================================================
+services:
+  mysql:
+    image: mysql:8
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    # Sem "ports": a porta 3306 NAO e publicada no computador/servidor.
+    expose:
+      - "3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    # Armazena os contadores de limite de tentativas de login, compartilhados
+    # entre os workers do gunicorn (correcao B6).
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      RATELIMIT_STORAGE_URI: redis://redis:6379/0
+      # A API so recebe trafego do nginx; confia em 1 proxy para obter o IP real.
+      TRUSTED_PROXY_COUNT: "1"
+    # Sem "ports": a API (5000) so e acessivel pelo nginx do frontend.
+    expose:
+      - "5000"
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  mysql_data:

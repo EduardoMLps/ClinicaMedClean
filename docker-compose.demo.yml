@@ -1,0 +1,13 @@
+# =====================================================================
+# Med Flow - complemento de DEMONSTRACAO (nao usar em producao)
+#
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
+#
+# Carrega database/seed_demo.sql: 10 pacientes ficticios, agendamentos e a
+# senha PUBLICA de teste do admin (admin@clinica.local / TesteSenha123!).
+# So roda na PRIMEIRA criacao do volume "mysql_data".
+# =====================================================================
+services:
+  mysql:
+    volumes:
+      - ./database/seed_demo.sql:/docker-entrypoint-initdb.d/02-seed_demo.sql:ro
